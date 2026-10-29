@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<title>分頁錄影機</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <section id="current" class="card"></section>
+
+  <section id="recordings-wrap" hidden>
+    <h2>錄影中 <span id="rec-count"></span></h2>
+    <ul id="recordings" class="list"></ul>
+  </section>
+
+  <section id="orphans-wrap" hidden>
+    <h2>未存的錄影 <small>（可能是當機或下載失敗留下的）</small></h2>
+    <ul id="orphans" class="list"></ul>
+  </section>
+
+  <details id="presets-wrap">
+    <summary>範圍組管理</summary>
+    <ul id="presets" class="list"></ul>
+    <p class="muted" id="presets-empty">還沒有範圍組。在網頁上框選後按「儲存範圍」就會出現在這裡。</p>
+  </details>
+
+  <details id="settings">
+    <summary>設定</summary>
+    <label>每段長度
+      <select id="segmentMinutes">
+        <option value="0">不分段</option>
+        <option value="10">10 分鐘</option>
+        <option value="15">15 分鐘</option>
+        <option value="30">30 分鐘</option>
+        <option value="60">60 分鐘</option>
+        <option value="120">120 分鐘</option>
+      </select>
+    </label>
+    <label>存檔資料夾
+      <span class="row"><span class="muted">下載／</span><input id="folder" type="text"></span>
+    </label>
+    <label>錄聲音 <input id="audio" type="checkbox"></label>
+    <label>影像編碼
+      <select id="codec">
+        <option value="auto">自動（優先 H.264，最省 CPU）</option>
+        <option value="h264">H.264</option>
+        <option value="vp8">VP8</option>
+        <option value="vp9">VP9（檔案小，最吃 CPU）</option>
+      </select>
+    </label>
+    <label>畫質
+      <select id="bitrateMbps">
+        <option value="2.5">一般（2.5 Mbps）</option>
+        <option value="6">高（6 Mbps）</option>
+        <option value="12">很高（12 Mbps）</option>
+      </select>
+    </label>
+    <label>每秒格數
+      <select id="fps">
+        <option value="30">30</option>
+        <option value="60">60</option>
+      </select>
+    </label>
+    <p class="muted">設定只會套用到之後開始的錄影。</p>
+  </details>
+
+  <footer class="muted">快捷鍵 <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>：開始／停止錄目前分頁（整個分頁）</footer>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

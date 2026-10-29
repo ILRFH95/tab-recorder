@@ -1,0 +1,79 @@
+:root {
+  --bg: #ffffff;
+  --fg: #202124;
+  --muted: #5f6368;
+  --line: #dadce0;
+  --card: #f1f3f4;
+  --accent: #1f3a5f;
+  --accent-ink: #ffffff;
+  --error: #8a5600;
+  --warn-bg: #fef7e0;
+  --warn-fg: #7a5200;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #202124;
+    --fg: #e8eaed;
+    --muted: #9aa0a6;
+    --line: #3c4043;
+    --card: #2d2e31;
+    --accent: #9bb3d6;
+    --accent-ink: #0e1726;
+    --error: #f2c35e;
+    --warn-bg: #3b3420;
+    --warn-fg: #fdd663;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  width: 380px;
+  margin: 0;
+  padding: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 "Microsoft JhengHei", system-ui, sans-serif;
+}
+h2 { font-size: 13px; margin: 14px 0 6px; }
+h2 small { font-weight: normal; color: var(--muted); }
+.card { background: var(--card); border-radius: 10px; padding: 10px 12px; }
+.title { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.muted { color: var(--muted); font-size: 12px; }
+.row { display: flex; gap: 6px; align-items: center; }
+.row.wrap { flex-wrap: wrap; }
+.spacer { flex: 1; }
+button {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover { filter: brightness(0.95); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+button.small { padding: 2px 8px; font-size: 12px; }
+select, input[type="text"] {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+.clock { font: bold 26px/1.1 Consolas, monospace; color: var(--accent); }
+.warn { background: var(--warn-bg); color: var(--warn-fg); border-radius: 6px; padding: 6px 8px; margin-top: 8px; font-size: 12px; }
+.error { color: var(--error); font-size: 12px; margin-top: 6px; }
+.list { list-style: none; margin: 0; padding: 0; }
+.list li { border-bottom: 1px solid var(--line); padding: 7px 0; }
+.list li:last-child { border-bottom: 0; }
+.rec-clock { font: bold 16px Consolas, monospace; color: var(--accent); }
+.link { cursor: pointer; }
+.link:hover { text-decoration: underline; }
+details { margin-top: 12px; }
+summary { cursor: pointer; font-weight: bold; }
+#settings label { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; gap: 8px; }
+#folder { width: 150px; }
+footer { margin-top: 14px; }
+kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; }

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "分頁錄影機",
+  "version": "1.0.0",
+  "description": "錄製分頁（可框選範圍、同時錄多個分頁），工具列顯示錄影時間，每秒寫入硬碟、當機可救回，可自動分段。",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabCapture", "offscreen", "downloads", "storage", "activeTab", "scripting", "alarms"],
+  "background": { "service_worker": "sw.js", "type": "module" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "分頁錄影機",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "commands": {
+    "toggle-recording": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "開始／停止錄目前分頁（整個分頁）"
+    }
+  }
+}
