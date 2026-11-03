@@ -81,6 +81,27 @@ ffmpeg -i 輸入.webm -c copy 輸出.webm
 ffmpeg -i 輸入.webm -c:v copy -c:a aac 輸出.mp4
 ```
 
+### 批次轉成 MP4（方便剪輯）
+
+`tools/` 裡有一個批次轉檔小工具，需要先安裝 [ffmpeg](https://ffmpeg.org/)。雙擊 `tools\轉成MP4.bat` 就會：
+
+1. 找出「下載／ScreenRecorder」裡最後修改超過 1 小時的 webm，還在錄或還在下載的檔案不會動到。
+2. 轉成 MP4，放到 `ScreenRecorder\轉好的MP4`。畫面不重新壓縮，畫質不變，30 分鐘的錄影大約 40 秒。
+3. 轉好的原檔移到 `ScreenRecorder\已轉的原檔`。
+4. 轉失敗的檔案留在原地，下次執行會重試。
+
+資料夾不存在會自動建立；同名檔案不會被覆蓋，會在後面加 ` (2)`。
+
+進階用法（在 PowerShell 執行）：
+
+```powershell
+# 處理別的資料夾、改成 30 分鐘以前的檔案就轉
+.\tools\convert-to-mp4.ps1 -Folder "D:\錄影" -MinAgeMinutes 30
+
+# 剪輯軟體出現聲音不同步時：重新壓縮成固定每秒 30 格（比較慢）
+.\tools\convert-to-mp4.ps1 -Cfr
+```
+
 ## 設定說明
 
 | 設定 | 說明 |
@@ -112,6 +133,7 @@ ffmpeg -i 輸入.webm -c:v copy -c:a aac 輸出.mp4
 | `popup.html` / `popup.js` / `popup.css` | 工具列彈出視窗 |
 | `common.js` | 設定預設值與時間格式 |
 | `docs/` | README 的 logo 和 GitHub 分享預覽圖 |
+| `tools/` | 批次把錄影轉成 MP4 的小工具（Windows，需要 ffmpeg） |
 
 ## 授權
 
