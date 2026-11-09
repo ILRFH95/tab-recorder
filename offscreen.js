@@ -2,10 +2,14 @@
 //
 // 每個 OPFS 檔案的生命週期：busy（寫入中）→ downloading（交給瀏覽器下載）→ 下載完成後由 sw.js 刪除。
 // 兩個集合之間不留空檔，所以檔案在任何時刻都不會被誤認成「未存的錄影」。
-import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect } from './recorder-core.js';
+import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep } from './recorder-core.js';
 import { tempFileName } from './common.js';
 
 const MAX_QUEUED_BYTES = 256 * 1024 * 1024; // 還沒寫進硬碟的資料超過這個量就停止錄影
+// 自動暫停：沒畫面也沒聲音持續 30 秒就暫停（這段存檔），畫面或聲音恢復持續 3 秒就開新檔案繼續錄
+const PAUSE_AFTER_MS = 30000;
+const RESUME_AFTER_MS = 3000;
+const SOUND_RMS = 0.004; // 約 -48 dBFS，低於這個音量算沒聲音
 const writer = new OpfsWriter('opfs-worker.js');
 const recs = new Map(); // id -> 錄影
 const busy = new Set(); // 正在寫入的 OPFS 檔名
@@ -13,6 +17,7 @@ const downloading = new Map(); // 檔名 -> blob URL（下載中；null 代表�
 const recentErrors = [];
 let queuedBytes = 0;
 let wasRecording = false;
+let idleSince = null;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.target !== 'offscreen') return;
@@ -40,6 +45,11 @@ async function handle(msg) {
         rec.crop = msg.crop;
         rec.cropper.refresh(); // 下一格起套用新範圍，縮放到固定的輸出尺寸
       }
+      // 「自動框住影片」回報影片停止或不見了，自動暫停時算作沒畫面
+      if (msg.videoState) {
+        rec.videoGone = msg.videoState !== 'playing';
+        rec.videoStateAt = Date.now();
+      }
       return {};
     }
     case 'setMonitorMuted': {
@@ -57,10 +67,15 @@ async function handle(msg) {
       return {};
     case 'downloadDone': {
       const url = downloading.get(msg.name);
+      // 只處理這一次下載：同一個檔案若已在重試，網址會不同，不能動到
+      if (msg.url && url !== msg.url) return {};
       if (url) URL.revokeObjectURL(url);
       downloading.delete(msg.name);
       return {};
     }
+    case 'note':
+      noteError('', msg.message);
+      return {};
     default:
       throw new Error(`未知的指令：${msg.type}`);
   }
@@ -79,7 +94,10 @@ function snapshot() {
       tabId: r.tabId,
       title: r.title,
       startedAt: r.startedAt,
-      segStartedAt: r.current.startedAt,
+      segStartedAt: r.current?.startedAt ?? null,
+      paused: r.paused,
+      pausedAt: r.pausedAt,
+      pausedMs: r.pausedMs,
       part: r.part,
       cropLabel: r.cropLabel,
       size: r.cropper.info.outW ? `${r.cropper.info.outW}×${r.cropper.info.outH}` : '',
@@ -108,6 +126,14 @@ async function start(msg) {
     stopping: false,
     rotating: false,
     error: null,
+    paused: false, // 自動暫停中：沒有正在寫的檔案（current 是 null）
+    pausedAt: null,
+    pausedMs: 0, // 累計暫停時間，不算進錄影時間
+    quietSince: null,
+    activeSince: null,
+    lastSoundAt: Date.now(),
+    videoGone: false,
+    videoStateAt: 0,
   };
 
   try {
@@ -131,16 +157,26 @@ async function start(msg) {
     if (audioTracks.length) {
       rec.audioCtx = new AudioContext();
       rec.monitor = rec.audioCtx.createGain();
-      rec.audioCtx.createMediaStreamSource(new MediaStream(audioTracks)).connect(rec.monitor);
+      const source = rec.audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+      source.connect(rec.monitor);
       rec.monitor.connect(rec.audioCtx.destination);
+      // 量音量給自動暫停用；接在「靜音播放」之前，靜音播放時一樣量得到
+      rec.analyser = rec.audioCtx.createAnalyser();
+      rec.analyser.fftSize = 2048;
+      source.connect(rec.analyser);
       rec.audioCtx.resume().catch(() => {});
     }
 
     // 整個分頁也走裁切流程，順便去掉擷取畫面可能出現的黑邊。
-    // 只有第一格用分頁寬高比判斷黑邊；之後尺寸改變時直接對整個畫面套用比例。
+    // 來源尺寸跟第一格相同時，用開始錄影時的分頁寬高比判斷黑邊（範圍更新後也一樣）；
+    // 尺寸變了代表分頁大小變了，舊的寬高比不準，直接對整個畫面套用比例。
+    let firstSize = null;
     rec.cropper = createCroppedTrack(
       src,
-      (fw, fh, isFirst) => computeRect(fw, fh, isFirst ? tabW / tabH : null, rec.crop),
+      (fw, fh) => {
+        firstSize ??= `${fw}x${fh}`;
+        return computeRect(fw, fh, firstSize === `${fw}x${fh}` ? tabW / tabH : null, rec.crop);
+      },
       (err) => endWithError(rec, `畫面處理失敗：${err.message}`),
     );
     rec.stream = new MediaStream([rec.cropper.track, ...audioTracks]);
@@ -174,43 +210,43 @@ async function startSegment(rec) {
     throw err;
   }
 
-  let mr;
+  let seg;
   try {
     if (rec.stopping) throw new Error('stopping');
-    mr = new MediaRecorder(rec.stream, {
+    const mr = new MediaRecorder(rec.stream, {
       mimeType: rec.mime,
       videoBitsPerSecond: rec.settings.bitrateMbps * 1e6,
       audioBitsPerSecond: 128000,
     });
+    seg = { name, mr, startedAt: Date.now(), chain: Promise.resolve(), failed: false };
+    seg.stopped = new Promise((resolve) => { mr.onstop = resolve; });
+    mr.ondataavailable = (e) => {
+      if (!e.data.size || seg.failed) return;
+      const size = e.data.size;
+      // 連同這一塊一起算，超過上限就停止，避免記憶體被塞爆
+      if (queuedBytes + size > MAX_QUEUED_BYTES) {
+        failSegment(rec, seg, '硬碟寫入速度跟不上，已停止錄影');
+        return;
+      }
+      queuedBytes += size;
+      seg.chain = seg.chain
+        .then(async () => {
+          if (seg.failed) return;
+          await writer.write(name, await e.data.arrayBuffer());
+        })
+        .catch((err) => failSegment(rec, seg, `寫檔失敗：${err.message}`))
+        .finally(() => { queuedBytes -= size; });
+    };
+    mr.onerror = (e) => endWithError(rec, `錄影錯誤：${e.error?.message || e.error || '未知'}`);
+    mr.start(1000); // 每秒產生一段資料並寫進硬碟
   } catch (err) {
-    // 建立失敗或開檔期間使用者按了停止：關檔並刪掉這個空檔
+    // 建立或開始失敗、或開檔期間使用者按了停止：關檔並刪掉這個空檔
     await writer.close(name).catch(() => {});
     busy.delete(name);
     (await navigator.storage.getDirectory()).removeEntry(name).catch(() => {});
     if (rec.stopping) return;
     throw err;
   }
-
-  const seg = { name, mr, startedAt: Date.now(), chain: Promise.resolve(), failed: false };
-  seg.stopped = new Promise((resolve) => { mr.onstop = resolve; });
-  mr.ondataavailable = (e) => {
-    if (!e.data.size || seg.failed) return;
-    if (queuedBytes > MAX_QUEUED_BYTES) {
-      failSegment(rec, seg, '硬碟寫入速度跟不上，已停止錄影');
-      return;
-    }
-    const size = e.data.size;
-    queuedBytes += size;
-    seg.chain = seg.chain
-      .then(async () => {
-        if (seg.failed) return;
-        await writer.write(name, await e.data.arrayBuffer());
-      })
-      .catch((err) => failSegment(rec, seg, `寫檔失敗：${err.message}`))
-      .finally(() => { queuedBytes -= size; });
-  };
-  mr.onerror = (e) => endWithError(rec, `錄影錯誤：${e.error?.message || e.error || '未知'}`);
-  mr.start(1000); // 每秒產生一段資料並寫進硬碟
 
   rec.part = part;
   const prev = rec.current;
@@ -254,10 +290,49 @@ async function stop(id) {
   recs.delete(id);
   sendTick();
   const seg = rec.current;
+  if (!seg) {
+    releaseCapture(rec); // 暫停中：目前沒有正在寫的檔案
+    return;
+  }
   const done = finishSegment(rec, seg);
   await seg.stopped;
   releaseCapture(rec);
   await done;
+}
+
+// 自動暫停：結束並存下目前這段，之後恢復時開新檔案
+function pauseRecording(rec) {
+  if (rec.paused || !rec.current) return;
+  const seg = rec.current;
+  rec.current = null;
+  rec.paused = true;
+  rec.pausedAt = Date.now();
+  rec.activeSince = null;
+  finishSegment(rec, seg);
+  sendTick();
+}
+
+function resumeRecording(rec) {
+  if (!rec.paused) return;
+  rec.paused = false;
+  rec.pausedMs += Date.now() - rec.pausedAt;
+  rec.pausedAt = null;
+  rec.quietSince = null;
+  rec.rotating = true;
+  startSegment(rec)
+    .catch((err) => endWithError(rec, `恢復錄影失敗：${err.message}`))
+    .finally(() => { rec.rotating = false; sendTick(); });
+}
+
+function checkAutoPause(rec, now) {
+  if (!rec.settings.autoPause || rec.stopping || rec.rotating) return;
+  // 追蹤程式每 10 秒至少回報一次；超過 25 秒沒消息（例如換頁）就不採用舊的影片狀態，只看畫面
+  const videoGone = rec.videoGone && now - rec.videoStateAt < 25000;
+  const hasPicture = !rec.cropper.info.dark && !videoGone;
+  const hasSound = Boolean(rec.analyser) && now - rec.lastSoundAt < 1500;
+  const action = autoPauseStep(rec, hasPicture || hasSound, now, PAUSE_AFTER_MS, RESUME_AFTER_MS);
+  if (action === 'pause') pauseRecording(rec);
+  else if (action === 'resume') resumeRecording(rec);
 }
 
 // 把 OPFS 裡的檔案交給瀏覽器下載。下載完成後由 service worker 刪掉暫存。
@@ -293,8 +368,9 @@ function sendTick() {
 setInterval(() => {
   const now = Date.now();
   for (const rec of recs.values()) {
+    checkAutoPause(rec, now);
     const segMs = rec.settings.segmentMinutes * 60000;
-    if (segMs > 0 && !rec.stopping && !rec.rotating && now - rec.current.startedAt >= segMs) {
+    if (segMs > 0 && rec.current && !rec.stopping && !rec.rotating && now - rec.current.startedAt >= segMs) {
       rec.rotating = true;
       startSegment(rec)
         .catch((err) => noteError(rec.title, `分段失敗，繼續錄在同一個檔案：${err.message}`))
@@ -303,4 +379,37 @@ setInterval(() => {
   }
   if (recs.size || wasRecording) sendTick();
   wasRecording = recs.size > 0;
+  // 沒有錄影、寫入和下載持續一分鐘，就請背景程式把這個錄影程序關掉（下次要用時再開）
+  if (recs.size || busy.size || downloading.size) {
+    idleSince = null;
+  } else {
+    idleSince ??= now;
+    if (now - idleSince >= 60000) {
+      idleSince = now; // 背景程式沒關的話，一分鐘後再問一次
+      chrome.runtime.sendMessage({ target: 'sw', type: 'idle' }).catch(() => {});
+    }
+  }
 }, 1000);
+
+// 每 0.25 秒量一次各錄影的音量，有聲音就記下時間
+setInterval(() => {
+  const now = Date.now();
+  for (const rec of recs.values()) {
+    if (!rec.analyser) continue;
+    // 聲音處理沒在運作（被暫停或裝置出錯）時，量到的是舊資料，不能拿來判斷；
+    // 當作有聲音，寧可不自動暫停，並試著恢復
+    const t = rec.audioCtx.currentTime;
+    if (rec.audioCtx.state !== 'running' || t === rec.lastAudioTime) {
+      rec.lastSoundAt = now;
+      if (rec.audioCtx.state === 'suspended') rec.audioCtx.resume().catch(() => {});
+      rec.lastAudioTime = t;
+      continue;
+    }
+    rec.lastAudioTime = t;
+    rec.soundBuf ??= new Float32Array(rec.analyser.fftSize);
+    rec.analyser.getFloatTimeDomainData(rec.soundBuf);
+    let sum = 0;
+    for (const v of rec.soundBuf) sum += v * v;
+    if (Math.sqrt(sum / rec.soundBuf.length) > SOUND_RMS) rec.lastSoundAt = now;
+  }
+}, 250);

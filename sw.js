@@ -1,6 +1,7 @@
 // Service worker：取得分頁擷取權限、更新工具列徽章、處理下載。
 // 真正的錄影在 offscreen 文件裡進行（它會一直存在，service worker 可能被暫停）。
-import { getSettings, fmtBadge, safeName, downloadFileName } from './common.js';
+import { getSettings, fmtBadge, safeName, downloadFileName, recordedMs } from './common.js';
+import { videoTrackerMain } from './video-tracker.js';
 
 const EMPTY = { recordings: [], busyFiles: [], errors: [] };
 let lastState = EMPTY;
@@ -27,9 +28,34 @@ async function toOffscreen(msg) {
   return res;
 }
 
-async function startRecording({ tabId, crop, cropLabel, screenDpr, pageDpr }) {
+// 在分頁裡執行 videoTrackerMain：recId 為 null 時只量一次影片位置
+async function runVideoTracker(tabId, recId) {
+  const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: videoTrackerMain, args: [recId] });
+  return res?.result || null;
+}
+
+let activeOps = 0; // 進行中、會用到錄影程序的操作數；這段期間不關閉錄影程序
+
+async function withOp(fn) {
+  activeOps++;
+  try {
+    return await fn();
+  } finally {
+    activeOps--;
+  }
+}
+
+const startRecording = (args) => withOp(() => doStartRecording(args));
+
+// 整個開始流程都在 service worker 完成（包含「自動框住影片」的追蹤），彈出視窗中途關掉也不影響
+async function doStartRecording({ tabId, crop, cropLabel, screenDpr, pageDpr, autoVideo }) {
   if (lastState.recordings.some((r) => r.tabId === tabId)) throw new Error('這個分頁已經在錄影了');
   const tab = await chrome.tabs.get(tabId);
+  if (autoVideo) {
+    crop = await runVideoTracker(tabId, null).catch(() => null);
+    if (!crop) throw new Error('這個頁面找不到正在顯示的影片');
+    cropLabel = '自動框住影片';
+  }
   await ensureOffscreen();
   const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
   if (!screenDpr && pageDpr) {
@@ -50,6 +76,17 @@ async function startRecording({ tabId, crop, cropLabel, screenDpr, pageDpr }) {
     settings: await getSettings(),
   });
   applyState(res.state);
+  if (autoVideo) {
+    const rec = res.state.recordings.find((r) => r.tabId === tabId);
+    // 追蹤失敗時錄影照常進行，只是範圍固定在開始時的位置
+    if (rec) {
+      try {
+        await runVideoTracker(tabId, rec.id);
+      } catch (e) {
+        return { warning: `影片位置追蹤沒有啟動，範圍會固定在開始時的位置：${e.message}` };
+      }
+    }
+  }
   return {};
 }
 
@@ -77,7 +114,8 @@ function updateBadges() {
   }
   // 沒在錄的分頁顯示最早開始的那個錄影；在錄的分頁顯示自己的時間
   const oldest = recs.reduce((a, b) => (a.startedAt <= b.startedAt ? a : b));
-  const globalText = fmtBadge(now - oldest.startedAt);
+  const badge = (r) => (r.paused ? '暫停' : fmtBadge(recordedMs(r, now)));
+  const globalText = badge(oldest);
   chrome.action.setBadgeBackgroundColor({ color: '#1f3a5f' });
   chrome.action.setBadgeTextColor?.({ color: '#ffffff' });
   chrome.action.setBadgeText({ text: globalText });
@@ -85,7 +123,7 @@ function updateBadges() {
   for (const r of recs) {
     recording.add(r.tabId);
     badgedTabs.add(r.tabId);
-    chrome.action.setBadgeText({ tabId: r.tabId, text: fmtBadge(now - r.startedAt) }).catch(() => {});
+    chrome.action.setBadgeText({ tabId: r.tabId, text: badge(r) }).catch(() => {});
   }
   for (const tabId of badgedTabs) {
     if (recording.has(tabId)) continue;
@@ -95,7 +133,8 @@ function updateBadges() {
   const lines = recs.map((r) => {
     const title = r.title.length > 24 ? `${r.title.slice(0, 24)}…` : r.title;
     const seg = r.part > 1 ? `，第 ${r.part} 段` : '';
-    return `● ${fmtMinutes(now - r.startedAt)}${seg}　${title}`;
+    const pause = r.paused ? '，自動暫停中' : '';
+    return `● ${fmtMinutes(recordedMs(r, now))}${seg}${pause}　${title}`;
   });
   setTooltip(`錄影中 ${recs.length} 個（點圖示看精確時間）\n${lines.join('\n')}`);
 }
@@ -163,24 +202,52 @@ async function startDownload({ url, name }) {
   return {};
 }
 
-// 可以重複呼叫：第二次會因為找不到 key 而直接結束
+// onChanged 和 startDownload 的補查可能同時呼叫，同一個下載只處理一次
+const finishing = new Set();
+
 async function finishDownload(id, state) {
-  const key = `dl:${id}`;
-  const name = (await chrome.storage.session.get(key))[key];
-  if (!name) return;
-  await chrome.storage.session.remove(key);
-  const [item] = await chrome.downloads.search({ id });
-  if (item) {
-    wantedNames.delete(item.url);
-    await chrome.storage.session.remove(`name:${item.url}`);
+  if (finishing.has(id)) return;
+  finishing.add(id);
+  try {
+    const key = `dl:${id}`;
+    const name = (await chrome.storage.session.get(key))[key];
+    if (!name) return; // 已經處理過
+    await chrome.storage.session.remove(key);
+    const [item] = await chrome.downloads.search({ id });
+    let wanted = null;
+    if (item) {
+      const nameKey = `name:${item.url}`;
+      wanted = wantedNames.get(item.url) || (await chrome.storage.session.get(nameKey))[nameKey];
+      wantedNames.delete(item.url);
+      await chrome.storage.session.remove(nameKey);
+    }
+    if (state === 'complete') {
+      // 已經存到下載資料夾，刪掉 OPFS 裡的暫存
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(name).catch(() => {});
+      // 其他下載工具（例如 IDM）可能還是改掉了檔名或位置，檔案有存到，但要讓使用者知道在哪
+      if (item?.filename && wanted && !sameSavedName(item.filename, wanted)) {
+        notify(`檔名或位置被其他擴充功能改掉了，實際存在：${item.filename}`);
+      }
+    }
+    // 失敗的話保留 OPFS 檔案，之後會出現在「未存的錄影」清單。
+    // 帶上 URL，錄影程序只釋放這一次下載用的網址（同一個檔案可能已經在重試）
+    chrome.runtime.sendMessage({ target: 'offscreen', type: 'downloadDone', name, url: item?.url }).catch(() => {});
+  } finally {
+    finishing.delete(id);
   }
-  if (state === 'complete') {
-    // 已經存到下載資料夾，刪掉 OPFS 裡的暫存
-    const root = await navigator.storage.getDirectory();
-    await root.removeEntry(name).catch(() => {});
-  }
-  // 失敗的話保留 OPFS 檔案，之後會出現在「未存的錄影」清單
-  chrome.runtime.sendMessage({ target: 'offscreen', type: 'downloadDone', name }).catch(() => {});
+}
+
+// 實際存檔路徑是否就是我們要的「資料夾/檔名」（瀏覽器遇到同名會加 (1)，也算符合）
+function sameSavedName(actual, wanted) {
+  const parts = actual.split(/[\\/]/);
+  const [folder, file] = wanted.split('/');
+  const base = file.replace(/\.webm$/, '');
+  return parts.at(-2) === folder && parts.at(-1).startsWith(base);
+}
+
+function notify(message) {
+  chrome.runtime.sendMessage({ target: 'offscreen', type: 'note', message }).catch(() => {});
 }
 
 chrome.downloads.onChanged.addListener((delta) => {
@@ -233,21 +300,31 @@ async function handle(msg, sender) {
     case 'download':
       return startDownload(msg);
     case 'saveOrphan':
-      await ensureOffscreen();
-      await toOffscreen({ type: 'saveFile', name: msg.name });
+      return withOp(async () => {
+        await ensureOffscreen();
+        await toOffscreen({ type: 'saveFile', name: msg.name });
+        return {};
+      });
+    case 'idle': // 錄影程序閒置一分鐘：沒有錄影、寫入和下載時就關掉它，釋放資源
+      if (activeOps === 0) {
+        const { state } = await toOffscreen({ type: 'state' });
+        if (activeOps === 0 && !state.recordings.length && !state.busyFiles.length) {
+          await chrome.offscreen.closeDocument().catch(() => {});
+          applyState(EMPTY);
+        }
+      }
       return {};
     case 'setMonitorMuted': {
       const res = await toOffscreen({ type: 'setMonitorMuted', id: msg.id, muted: msg.muted });
       applyState(res.state);
       return { state: lastState };
     }
-    case 'videoRect': // 「自動框住影片」回報新位置
-    case 'videoAlive': // 位置沒變，只確認錄影還在
+    case 'videoUpdate': // 「自動框住影片」回報新位置或影片狀態，也用來確認錄影還在
       if (!(await hasOffscreen())) throw new Error('錄影已經結束');
-      await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.type === 'videoRect' ? msg.crop : null });
+      await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.crop, videoState: msg.videoState });
       return {};
     case 'deleteFile':
-      return deleteFile(msg.name);
+      return withOp(() => deleteFile(msg.name));
     case 'savePreset':
       return savePreset(msg, sender);
     default:
@@ -292,8 +369,8 @@ async function recoverLeftovers() {
   }
 }
 
-chrome.runtime.onStartup.addListener(() => { recoverLeftovers(); });
-chrome.runtime.onInstalled.addListener(() => { recoverLeftovers(); });
+chrome.runtime.onStartup.addListener(() => { withOp(recoverLeftovers); });
+chrome.runtime.onInstalled.addListener(() => { withOp(recoverLeftovers); });
 
 // 錄影程序每秒會回報一次；超過 5 秒沒消息代表它不在了，清掉徽章
 chrome.alarms.create('watchdog', { periodInMinutes: 0.5 });

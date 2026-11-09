@@ -7,14 +7,23 @@ export const DEFAULT_SETTINGS = {
   codec: 'auto', // auto | h264 | vp8 | vp9
   bitrateMbps: 6,
   fps: 30,
+  autoPause: true, // 沒畫面也沒聲音 30 秒就自動暫停，恢復後存成新檔案
 };
 
 export async function getSettings() {
   const { settings } = await chrome.storage.local.get('settings');
-  return { ...DEFAULT_SETTINGS, ...settings };
+  const s = { ...DEFAULT_SETTINGS, ...settings };
+  // 舊版把編碼選項存成了 NaN，修正回預設
+  if (!['auto', 'h264', 'vp8', 'vp9'].includes(s.codec)) s.codec = DEFAULT_SETTINGS.codec;
+  return s;
 }
 
 const pad = (n) => String(n).padStart(2, '0');
+
+// 實際錄到的時間：從開始到現在，扣掉自動暫停的時間
+export function recordedMs(r, now = Date.now()) {
+  return now - r.startedAt - (r.pausedMs || 0) - (r.pausedAt ? now - r.pausedAt : 0);
+}
 
 export function fmtClock(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));

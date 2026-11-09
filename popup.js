@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, getSettings, fmtClock, fmtSize } from './common.js';
+import { DEFAULT_SETTINGS, getSettings, fmtClock, fmtSize, recordedMs } from './common.js';
 import { overlayMain } from './overlay.js';
 import { videoTrackerMain } from './video-tracker.js';
 
@@ -116,9 +116,9 @@ function renderPresetWarning() {
     `這組範圍是在 ${p.refW}×${p.refH} 的分頁大小下存的，現在分頁是 ${tab.width}×${tab.height}，框到的位置可能會偏掉。建議按「在網頁上框選…」確認一下。`));
 }
 
-// 在分頁裡執行 videoTrackerMain：recId 為 null 時只量一次影片位置
-async function runVideoTracker(recId) {
-  const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: videoTrackerMain, args: [recId] });
+// 在分頁裡量一次影片位置（給「在網頁上框選…」當起始位置）
+async function measureVideo() {
+  const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: videoTrackerMain, args: [null] });
   return res?.result || null;
 }
 
@@ -127,24 +127,16 @@ async function startSelected() {
   const p = selectedPreset();
   lastError = '';
   try {
-    let crop = p ? p.crop : null;
-    if (autoVideo) {
-      crop = await runVideoTracker(null).catch(() => null);
-      if (!crop) throw new Error('這個頁面找不到正在顯示的影片');
-    }
-    await send({
+    // 「自動框住影片」的量測和追蹤都由背景程式處理，彈出視窗關掉也不影響
+    const res = await send({
       type: 'start',
       tabId: tab.id,
-      crop,
-      cropLabel: autoVideo ? '自動框住影片' : p ? p.name : '整個分頁',
+      crop: autoVideo ? null : p ? p.crop : null,
+      cropLabel: autoVideo ? '' : p ? p.name : '整個分頁',
+      autoVideo,
       screenDpr: devicePixelRatio,
     });
-    if (autoVideo) {
-      await refreshState();
-      const rec = currentRec();
-      // 追蹤失敗時錄影照常進行，只是範圍固定在開始時的位置
-      if (rec) await runVideoTracker(rec.id).catch((e) => { lastError = `影片位置追蹤沒有啟動：${e.message}`; });
-    }
+    if (res.warning) lastError = res.warning;
   } catch (e) {
     lastError = `無法開始錄影：${e.message}`;
   }
@@ -156,7 +148,7 @@ async function pickOnPage() {
   const p = selectedPreset();
   let initial = p ? p.crop : null;
   // 選「自動框住影片」時，先把框放在影片上，方便微調
-  if ($('#crop-sel')?.value === AUTO_VIDEO) initial = await runVideoTracker(null).catch(() => null);
+  if ($('#crop-sel')?.value === AUTO_VIDEO) initial = await measureVideo().catch(() => null);
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: overlayMain, args: [initial] });
     window.close();
@@ -227,8 +219,11 @@ function renderRecordings() {
 function updateClocks() {
   const now = Date.now();
   for (const r of state.recordings) {
-    for (const node of document.querySelectorAll(`[data-clock="${r.id}"]`)) node.textContent = fmtClock(now - r.startedAt);
-    const seg = `第 ${r.part} 段 ${fmtClock(now - r.segStartedAt)} · ${r.cropLabel}${r.size ? ` ${r.size}` : ''}`;
+    for (const node of document.querySelectorAll(`[data-clock="${r.id}"]`)) node.textContent = fmtClock(recordedMs(r, now));
+    const where = `${r.cropLabel}${r.size ? ` ${r.size}` : ''}`;
+    const seg = r.paused
+      ? `沒畫面也沒聲音，自動暫停中 ${fmtClock(now - r.pausedAt)} · ${where}`
+      : `第 ${r.part} 段 ${fmtClock(now - r.segStartedAt)} · ${where}`;
     for (const node of document.querySelectorAll(`[data-seg="${r.id}"]`)) node.textContent = seg;
   }
 }
@@ -326,7 +321,7 @@ async function deletePreset(id) {
 
 async function initSettings() {
   const s = await getSettings();
-  const fields = ['segmentMinutes', 'folder', 'audio', 'codec', 'bitrateMbps', 'fps'];
+  const fields = ['segmentMinutes', 'folder', 'audio', 'codec', 'bitrateMbps', 'fps', 'autoPause'];
   for (const key of fields) {
     const input = $(`#${key}`);
     if (input.type === 'checkbox') input.checked = s[key];
@@ -336,6 +331,7 @@ async function initSettings() {
       let v;
       if (input.type === 'checkbox') v = input.checked;
       else if (key === 'folder') v = input.value.trim() || DEFAULT_SETTINGS.folder;
+      else if (key === 'codec') v = input.value;
       else v = Number(input.value);
       await chrome.storage.local.set({ settings: { ...cur, [key]: v } });
     });
@@ -346,7 +342,7 @@ async function initSettings() {
 
 function renderAll(force = false) {
   // 只有錄影清單或目前分頁狀態變了才重建畫面，避免按鈕在點擊時被換掉
-  const key = `${state.recordings.map((r) => `${r.id}:${r.part}:${r.error || ''}:${r.monitorMuted}`).join(',')}|${currentRec()?.id || ''}|${state.errors?.[0]?.time || ''}`;
+  const key = `${state.recordings.map((r) => `${r.id}:${r.part}:${r.error || ''}:${r.monitorMuted}:${r.paused}`).join(',')}|${currentRec()?.id || ''}|${state.errors?.[0]?.time || ''}`;
   if (force || key !== structureKey) {
     structureKey = key;
     renderCurrent();

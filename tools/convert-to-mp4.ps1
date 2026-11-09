@@ -16,13 +16,23 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$outDir = Join-Path $Folder '轉好的MP4'
-$doneDir = Join-Path $Folder '已轉的原檔'
 
 $ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
 if (-not $ffmpeg -and (Test-Path 'C:\ffmpeg\bin\ffmpeg.exe')) { $ffmpeg = 'C:\ffmpeg\bin\ffmpeg.exe' }
 if (-not $ffmpeg) { Write-Host '找不到 ffmpeg，請先安裝並加入 PATH。' -ForegroundColor Red; exit 1 }
 if (-not (Test-Path -LiteralPath $Folder)) { Write-Host "找不到資料夾：$Folder" -ForegroundColor Red; exit 1 }
+# 換成完整路徑：ffmpeg、PowerShell 和 .NET 對相對路徑的解讀可能不同
+$Folder = (Resolve-Path -LiteralPath $Folder).ProviderPath
+$outDir = Join-Path $Folder '轉好的MP4'
+$doneDir = Join-Path $Folder '已轉的原檔'
+
+# 同一時間只允許一個轉檔視窗，避免兩個視窗搶同一批檔案、互刪暫存檔
+$mutex = New-Object System.Threading.Mutex($false, 'Local\tab-recorder-convert-to-mp4')
+try {
+  if (-not $mutex.WaitOne(0)) { Write-Host '已經有另一個轉檔視窗在執行，請等它結束再開。' -ForegroundColor Yellow; exit 1 }
+} catch [System.Threading.AbandonedMutexException] {
+  # 上一個視窗被直接關掉，鎖已經轉給這次執行
+}
 
 $cutoff = (Get-Date).AddMinutes(-$MinAgeMinutes)
 $files = @(Get-ChildItem -LiteralPath $Folder -File -Filter *.webm | Where-Object { $_.LastWriteTime -lt $cutoff } | Sort-Object Name)
@@ -30,7 +40,9 @@ if ($files.Count -eq 0) { Write-Host "沒有超過 $MinAgeMinutes 分鐘的 webm
 
 New-Item -ItemType Directory -Force -Path $outDir, $doneDir | Out-Null
 # 上次執行到一半被關掉留下的暫存檔，對應的原檔還沒搬走，這次會重轉
-Get-ChildItem -LiteralPath $outDir -File -Filter '~轉檔中_*' | ForEach-Object { [IO.File]::Delete($_.FullName) }
+Get-ChildItem -LiteralPath $outDir -File -Filter '~轉檔中_*' | ForEach-Object {
+  try { [IO.File]::Delete($_.FullName) } catch { Write-Host "  無法刪除殘留的暫存檔：$($_.Exception.Message)" -ForegroundColor Yellow }
+}
 Write-Host "共 $($files.Count) 個檔案要轉。轉好的放在：$outDir" -ForegroundColor Cyan
 
 # 已存在同名檔案時，在檔名後面加 (2)、(3)…

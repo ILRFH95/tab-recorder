@@ -1,73 +1,134 @@
 // 「自動框住影片」：找出網頁裡最大、正在顯示的影片，回傳它實際畫面（扣掉黑邊）在可視區的位置比例。
 // 這個函式會被 chrome.scripting.executeScript 注入到分頁裡執行，所以必須自給自足，不能引用外部變數。
 //
-// recId 是 null 時只量一次就回傳；有 recId 時會持續追蹤，位置改變就通知錄影程序更新範圍。
+// recId 是 null 時只量一次就回傳；有 recId 時會持續追蹤，位置改變或影片停止／不見時通知錄影程序。
 // 換頁後這段程式會消失（沒有申請網站權限），錄影會停在最後的位置繼續錄。
 export function videoTrackerMain(recId) {
-  function contentRect(v) {
-    const r = v.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return null;
-    const cs = getComputedStyle(v);
-    let x = r.left + parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft);
-    let y = r.top + parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop);
-    let w = v.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-    let h = v.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
-    const vw = v.videoWidth, vh = v.videoHeight;
-    const fit = cs.objectFit;
-    // 影片預設是 contain：畫面等比縮放放進元素裡，多出來的是黑邊，要扣掉
-    if (vw && vh && fit !== 'fill' && fit !== 'cover') {
-      let scale = Math.min(w / vw, h / vh);
-      if (fit === 'none') scale = 1;
-      if (fit === 'scale-down') scale = Math.min(scale, 1);
-      const cw = vw * scale, ch = vh * scale;
-      x += (w - cw) / 2;
-      y += (h - ch) / 2;
-      w = cw;
-      h = ch;
-    }
-    // 只留在可視區裡的部分
-    const left = Math.max(0, x), top = Math.max(0, y);
-    const right = Math.min(innerWidth, x + w), bottom = Math.min(innerHeight, y + h);
-    if (right - left < 2 || bottom - top < 2) return null;
-    return { x: left, y: top, w: right - left, h: bottom - top };
+  const px = (v) => parseFloat(v) || 0;
+
+  // object-position 的一個軸：百分比依剩餘空間計算，px 直接位移，其他當置中
+  function axisOffset(token, free) {
+    if (!token) return free / 2;
+    if (token.endsWith('%')) return (free * parseFloat(token)) / 100;
+    if (token.endsWith('px')) return parseFloat(token);
+    return free / 2;
   }
 
-  function measure() {
-    let best = null;
+  function contentRect(v) {
+    const r = v.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2 || !v.offsetWidth || !v.offsetHeight) return null;
+    // 元素可能被 transform 縮放：先在元素自己的座標算，最後再乘上縮放比例
+    const sx = r.width / v.offsetWidth, sy = r.height / v.offsetHeight;
+    const cs = getComputedStyle(v);
+    const left = px(cs.borderLeftWidth) + px(cs.paddingLeft);
+    const top = px(cs.borderTopWidth) + px(cs.paddingTop);
+    const boxW = v.offsetWidth - left - px(cs.borderRightWidth) - px(cs.paddingRight);
+    const boxH = v.offsetHeight - top - px(cs.borderBottomWidth) - px(cs.paddingBottom);
+    if (boxW < 2 || boxH < 2) return null;
+
+    let cw = boxW, ch = boxH;
+    const vw = v.videoWidth, vh = v.videoHeight, fit = cs.objectFit;
+    if (vw && vh && fit !== 'fill') {
+      let scale;
+      if (fit === 'cover') scale = Math.max(boxW / vw, boxH / vh);
+      else if (fit === 'none') scale = 1;
+      else if (fit === 'scale-down') scale = Math.min(boxW / vw, boxH / vh, 1);
+      else scale = Math.min(boxW / vw, boxH / vh); // contain（影片預設）
+      cw = vw * scale;
+      ch = vh * scale;
+    }
+    // object-position 決定畫面在元素裡的位置（預設置中）；超出元素的部分會被裁掉
+    const [posX, posY] = cs.objectPosition.split(/\s+/);
+    let x = axisOffset(posX, boxW - cw), y = axisOffset(posY, boxH - ch);
+    const x2 = Math.min(boxW, x + cw), y2 = Math.min(boxH, y + ch);
+    x = Math.max(0, x);
+    y = Math.max(0, y);
+    if (x2 - x < 2 || y2 - y < 2) return null;
+
+    // 換成可視區座標，只留在可視區裡的部分
+    const vx1 = Math.max(0, r.left + (left + x) * sx), vy1 = Math.max(0, r.top + (top + y) * sy);
+    const vx2 = Math.min(innerWidth, r.left + (left + x2) * sx), vy2 = Math.min(innerHeight, r.top + (top + y2) * sy);
+    if (vx2 - vx1 < 2 || vy2 - vy1 < 2) return null;
+    return { x: vx1, y: vy1, w: vx2 - vx1, h: vy2 - vy1 };
+  }
+
+  // 回傳最大、正在顯示的影片元素和它的畫面位置（比例）；沒有影片時是 null
+  function findVideo() {
+    let best = null, bestEl = null;
     for (const v of document.querySelectorAll('video')) {
       const cs = getComputedStyle(v);
       if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) continue;
       const r = contentRect(v);
-      if (r && (!best || r.w * r.h > best.w * best.h)) best = r;
+      if (r && (!best || r.w * r.h > best.w * best.h)) { best = r; bestEl = v; }
     }
     if (!best) return null;
-    return { x: best.x / innerWidth, y: best.y / innerHeight, w: best.w / innerWidth, h: best.h / innerHeight };
+    return { el: bestEl, rect: { x: best.x / innerWidth, y: best.y / innerHeight, w: best.w / innerWidth, h: best.h / innerHeight } };
   }
 
-  if (!recId) return measure();
+  if (!recId) return findVideo()?.rect || null;
 
   window.__tabRecVideoTracker?.stop();
-  let last = measure();
+  let running = true;
   let timer = null;
+  let synced = null; // 錄影程序目前用的位置
+  let syncedState = null;
   const changed = (a, b) => !a || !b || ['x', 'y', 'w', 'h'].some((k) => Math.abs(a[k] - b[k]) > 0.002);
 
-  let ticks = 0;
+  // 用 requestVideoFrameCallback 記錄每支影片最後一次真的出新畫面的時間。
+  // 直播斷線時 currentTime 有時還會繼續走，看有沒有新畫面比較準
+  const frames = new WeakMap();
+  function watchFrames(v) {
+    if (frames.has(v) || !v.requestVideoFrameCallback) return;
+    const info = { lastFrameAt: performance.now() };
+    frames.set(v, info);
+    const onFrame = () => {
+      info.lastFrameAt = performance.now();
+      if (running) v.requestVideoFrameCallback(onFrame);
+    };
+    v.requestVideoFrameCallback(onFrame);
+  }
+
+  // 影片狀態（給自動暫停用）：missing＝沒有影片，stopped＝暫停、結束或 3 秒沒有新畫面，playing＝正常播放
+  let lastTime = -1, lastTimeChangedAt = performance.now(), lastEl = null;
+  function videoState(found) {
+    if (!found) return 'missing';
+    const v = found.el, now = performance.now();
+    if (v.paused || v.ended || v.readyState < 2) return 'stopped';
+    watchFrames(v);
+    const f = frames.get(v);
+    if (f) return now - f.lastFrameAt > 3000 ? 'stopped' : 'playing';
+    // 不支援 requestVideoFrameCallback 時改看 currentTime 有沒有前進
+    if (v !== lastEl || v.currentTime !== lastTime) {
+      lastEl = v;
+      lastTime = v.currentTime;
+      lastTimeChangedAt = now;
+    }
+    return now - lastTimeChangedAt > 3000 ? 'stopped' : 'playing';
+  }
+
+  let lastReportAt = 0;
   async function check() {
-    const now = measure();
-    const moved = now && changed(now, last); // 影片暫時不見時沿用最後的位置
-    // 位置沒變時每 10 秒問一次錄影還在不在，結束了就停止追蹤
-    if (!moved && ++ticks % 20 !== 0) return;
-    if (moved) last = now;
+    const found = findVideo();
+    const rect = found?.rect || null;
+    const state = videoState(found);
+    const moved = rect && changed(rect, synced); // 影片暫時不見時沿用最後的位置
+    // 沒有變化時每 10 秒回報一次，順便確認錄影還在，結束了就停止追蹤
+    if (!moved && state === syncedState && performance.now() - lastReportAt < 10000) return;
+    lastReportAt = performance.now();
     try {
-      const msg = moved ? { type: 'videoRect', recId, crop: now } : { type: 'videoAlive', recId };
-      const res = await chrome.runtime.sendMessage({ target: 'sw', ...msg });
-      if (!res?.ok) stop();
+      const res = await chrome.runtime.sendMessage({
+        target: 'sw', type: 'videoUpdate', recId, crop: moved ? rect : null, videoState: state,
+      });
+      if (!res?.ok) return stop();
+      if (moved) synced = rect; // 確定送到了才算同步
+      syncedState = state;
     } catch {
       stop();
     }
   }
 
   function stop() {
+    running = false;
     clearInterval(timer);
     removeEventListener('resize', check);
     removeEventListener('scroll', check, true);
@@ -78,5 +139,6 @@ export function videoTrackerMain(recId) {
   addEventListener('resize', check);
   addEventListener('scroll', check, true);
   window.__tabRecVideoTracker = { recId, stop };
-  return last;
+  check(); // 開始時馬上回報一次目前位置，以防從量測到開始錄影之間影片移動過
+  return findVideo()?.rect || null;
 }
