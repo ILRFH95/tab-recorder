@@ -83,6 +83,10 @@ export function createCroppedTrack(srcTrack, rectFor, onError) {
   return {
     track: generator,
     info,
+    // 範圍改了：下一格重新呼叫 rectFor
+    refresh() {
+      lastKey = '';
+    },
     stop() {
       stopped = true;
       reader.cancel().catch(() => {});

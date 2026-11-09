@@ -241,6 +241,11 @@ async function handle(msg, sender) {
       applyState(res.state);
       return { state: lastState };
     }
+    case 'videoRect': // 「自動框住影片」回報新位置
+    case 'videoAlive': // 位置沒變，只確認錄影還在
+      if (!(await hasOffscreen())) throw new Error('錄影已經結束');
+      await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.type === 'videoRect' ? msg.crop : null });
+      return {};
     case 'deleteFile':
       return deleteFile(msg.name);
     case 'savePreset':

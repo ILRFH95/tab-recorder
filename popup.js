@@ -1,5 +1,8 @@
 import { DEFAULT_SETTINGS, getSettings, fmtClock, fmtSize } from './common.js';
 import { overlayMain } from './overlay.js';
+import { videoTrackerMain } from './video-tracker.js';
+
+const AUTO_VIDEO = '__video__'; // 範圍選單裡「自動框住影片」的值
 
 const $ = (s) => document.querySelector(s);
 let tab = null;
@@ -64,7 +67,9 @@ function renderCurrent() {
       el('div', { class: 'muted', dataset: { seg: rec.id } }),
     );
   } else {
-    const sel = el('select', { id: 'crop-sel' }, el('option', { value: '', textContent: '整個分頁' }));
+    const sel = el('select', { id: 'crop-sel' },
+      el('option', { value: '', textContent: '整個分頁' }),
+      el('option', { value: AUTO_VIDEO, textContent: '自動框住影片' }));
     for (const p of presets) sel.append(el('option', { value: p.id, textContent: p.name }));
     sel.value = localStorage.getItem('lastPreset') || '';
     if (sel.selectedIndex < 0) sel.value = '';
@@ -111,17 +116,35 @@ function renderPresetWarning() {
     `這組範圍是在 ${p.refW}×${p.refH} 的分頁大小下存的，現在分頁是 ${tab.width}×${tab.height}，框到的位置可能會偏掉。建議按「在網頁上框選…」確認一下。`));
 }
 
+// 在分頁裡執行 videoTrackerMain：recId 為 null 時只量一次影片位置
+async function runVideoTracker(recId) {
+  const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: videoTrackerMain, args: [recId] });
+  return res?.result || null;
+}
+
 async function startSelected() {
+  const autoVideo = $('#crop-sel')?.value === AUTO_VIDEO;
   const p = selectedPreset();
   lastError = '';
   try {
+    let crop = p ? p.crop : null;
+    if (autoVideo) {
+      crop = await runVideoTracker(null).catch(() => null);
+      if (!crop) throw new Error('這個頁面找不到正在顯示的影片');
+    }
     await send({
       type: 'start',
       tabId: tab.id,
-      crop: p ? p.crop : null,
-      cropLabel: p ? p.name : '整個分頁',
+      crop,
+      cropLabel: autoVideo ? '自動框住影片' : p ? p.name : '整個分頁',
       screenDpr: devicePixelRatio,
     });
+    if (autoVideo) {
+      await refreshState();
+      const rec = currentRec();
+      // 追蹤失敗時錄影照常進行，只是範圍固定在開始時的位置
+      if (rec) await runVideoTracker(rec.id).catch((e) => { lastError = `影片位置追蹤沒有啟動：${e.message}`; });
+    }
   } catch (e) {
     lastError = `無法開始錄影：${e.message}`;
   }
@@ -131,8 +154,11 @@ async function startSelected() {
 
 async function pickOnPage() {
   const p = selectedPreset();
+  let initial = p ? p.crop : null;
+  // 選「自動框住影片」時，先把框放在影片上，方便微調
+  if ($('#crop-sel')?.value === AUTO_VIDEO) initial = await runVideoTracker(null).catch(() => null);
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: overlayMain, args: [p ? p.crop : null] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: overlayMain, args: [initial] });
     window.close();
   } catch (e) {
     lastError = `這個頁面不能框選（瀏覽器內建頁面或擴充功能商店等），只能錄整個分頁或用已存的範圍組。（${e.message}）`;

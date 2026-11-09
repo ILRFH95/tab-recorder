@@ -33,6 +33,15 @@ async function handle(msg) {
       return { state: snapshot() };
     case 'state':
       return { state: snapshot() };
+    case 'updateCrop': {
+      const rec = recs.get(msg.id);
+      if (!rec || rec.stopping) throw new Error('錄影已經結束');
+      if (msg.crop) {
+        rec.crop = msg.crop;
+        rec.cropper.refresh(); // 下一格起套用新範圍，縮放到固定的輸出尺寸
+      }
+      return {};
+    }
     case 'setMonitorMuted': {
       const rec = recs.get(msg.id);
       if (!rec?.monitor) throw new Error('這個錄影沒有錄聲音');
@@ -91,6 +100,7 @@ async function start(msg) {
     tabId,
     title: title || '',
     cropLabel,
+    crop, // 「自動框住影片」時會在錄影途中被更新
     settings,
     startedAt: Date.now(),
     part: 0,
@@ -130,7 +140,7 @@ async function start(msg) {
     // 只有第一格用分頁寬高比判斷黑邊；之後尺寸改變時直接對整個畫面套用比例。
     rec.cropper = createCroppedTrack(
       src,
-      (fw, fh, isFirst) => computeRect(fw, fh, isFirst ? tabW / tabH : null, crop),
+      (fw, fh, isFirst) => computeRect(fw, fh, isFirst ? tabW / tabH : null, rec.crop),
       (err) => endWithError(rec, `畫面處理失敗：${err.message}`),
     );
     rec.stream = new MediaStream([rec.cropper.track, ...audioTracks]);
