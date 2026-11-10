@@ -98,7 +98,12 @@ export function videoTrackerMain(recId) {
     return { el: bestEl, rect: { x: best.x / innerWidth, y: best.y / innerHeight, w: best.w / innerWidth, h: best.h / innerHeight } };
   }
 
-  if (!recId) return findVideo()?.rect || null;
+  // 只量一次：回傳位置，加上來源解析度（srcW、srcH，讓錄影尺寸不超過來源）
+  if (!recId) {
+    const found = findVideo();
+    if (!found) return null;
+    return { ...found.rect, srcW: found.el.videoWidth || 0, srcH: found.el.videoHeight || 0 };
+  }
 
   window.__tabRecVideoTracker?.stop();
   let running = true;
@@ -139,22 +144,49 @@ export function videoTrackerMain(recId) {
     return now - lastTimeChangedAt > 3000 ? 'stopped' : 'playing';
   }
 
-  let lastReportAt = 0;
+  // 來源位元率：Chromium 的 webkitVideoDecodedByteCount 是送進解碼器的壓縮資料總量，
+  // 每 5 秒以上算一次平均。不支援時是 null（不受網站的跨網域限制影響）
+  let meter = null, srcKbps = null;
+  function measureBitrate(v) {
+    if (!v || typeof v.webkitVideoDecodedByteCount !== 'number') return;
+    const now = performance.now(), bytes = v.webkitVideoDecodedByteCount;
+    if (!meter || meter.el !== v || bytes < meter.bytes) {
+      meter = { el: v, bytes, at: now };
+      return;
+    }
+    if (now - meter.at < 5000) return;
+    if (bytes > meter.bytes) srcKbps = Math.round(((bytes - meter.bytes) * 8) / (now - meter.at));
+    meter = { el: v, bytes, at: now };
+  }
+
+  let lastReportAt = 0, syncedSource = '';
   async function check() {
     const found = findVideo();
     const rect = found?.rect || null;
     const state = videoState(found);
+    measureBitrate(found?.el);
+    const source = found
+      ? {
+          w: found.el.videoWidth || 0,
+          h: found.el.videoHeight || 0,
+          kbps: srcKbps,
+          measurable: typeof found.el.webkitVideoDecodedByteCount === 'number',
+        }
+      : null;
+    const sourceKey = source ? `${source.w}x${source.h}` : '';
     const moved = rect && changed(rect, synced); // 影片暫時不見時沿用最後的位置
-    // 沒有變化時每 10 秒回報一次，順便確認錄影還在，結束了就停止追蹤
-    if (!moved && state === syncedState && performance.now() - lastReportAt < 10000) return;
+    // 沒有變化時每 10 秒回報一次（順便更新來源位元率），也確認錄影還在，結束了就停止追蹤
+    const sourceChanged = sourceKey && sourceKey !== syncedSource;
+    if (!moved && state === syncedState && !sourceChanged && performance.now() - lastReportAt < 10000) return;
     lastReportAt = performance.now();
     try {
       const res = await chrome.runtime.sendMessage({
-        target: 'sw', type: 'videoUpdate', recId, crop: moved ? rect : null, videoState: state,
+        target: 'sw', type: 'videoUpdate', recId, crop: moved ? rect : null, videoState: state, source,
       });
       if (!res?.ok) return stop();
       if (moved) synced = rect; // 確定送到了才算同步
       syncedState = state;
+      if (sourceKey) syncedSource = sourceKey;
     } catch {
       stop();
     }

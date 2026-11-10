@@ -51,9 +51,12 @@ const startRecording = (args) => withOp(() => doStartRecording(args));
 async function doStartRecording({ tabId, crop, cropLabel, screenDpr, pageDpr, autoVideo }) {
   if (lastState.recordings.some((r) => r.tabId === tabId)) throw new Error('這個分頁已經在錄影了');
   const tab = await chrome.tabs.get(tabId);
+  let source = null;
   if (autoVideo) {
-    crop = await runVideoTracker(tabId, null).catch(() => null);
-    if (!crop) throw new Error('這個頁面找不到正在顯示的影片');
+    const found = await runVideoTracker(tabId, null).catch(() => null);
+    if (!found) throw new Error('這個頁面找不到正在顯示的影片');
+    crop = { x: found.x, y: found.y, w: found.w, h: found.h };
+    if (found.srcW && found.srcH) source = { w: found.srcW, h: found.srcH, kbps: null };
     cropLabel = '自動框住影片';
   }
   await ensureOffscreen();
@@ -72,6 +75,7 @@ async function doStartRecording({ tabId, crop, cropLabel, screenDpr, pageDpr, au
     tabH: tab.height || 720,
     screenDpr,
     crop: crop || null,
+    source,
     cropLabel: cropLabel || (crop ? '自訂範圍' : '整個分頁'),
     settings: await getSettings(),
   });
@@ -321,7 +325,7 @@ async function handle(msg, sender) {
     }
     case 'videoUpdate': // 「自動框住影片」回報新位置或影片狀態，也用來確認錄影還在
       if (!(await hasOffscreen())) throw new Error('錄影已經結束');
-      await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.crop, videoState: msg.videoState });
+      await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.crop, videoState: msg.videoState, source: msg.source });
       return {};
     case 'deleteFile':
       return withOp(() => deleteFile(msg.name));

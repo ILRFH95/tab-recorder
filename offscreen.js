@@ -2,7 +2,7 @@
 //
 // 每個 OPFS 檔案的生命週期：busy（寫入中）→ downloading（交給瀏覽器下載）→ 下載完成後由 sw.js 刪除。
 // 兩個集合之間不留空檔，所以檔案在任何時刻都不會被誤認成「未存的錄影」。
-import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep } from './recorder-core.js';
+import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep, chooseBitrate, limitSize } from './recorder-core.js';
 import { tempFileName } from './common.js';
 
 const MAX_QUEUED_BYTES = 256 * 1024 * 1024; // 還沒寫進硬碟的資料超過這個量就停止錄影
@@ -46,6 +46,8 @@ async function handle(msg) {
         rec.cropper.refresh(); // 下一格起套用新範圍，縮放到固定的輸出尺寸
       }
       // 「自動框住影片」回報影片停止或不見了，自動暫停時算作沒畫面
+      // 影片來源規格：解析度隨時更新，位元率還沒量到時沿用上次的
+      if (msg.source?.w) rec.source = { ...msg.source, kbps: msg.source.kbps ?? rec.source?.kbps ?? null };
       if (msg.videoState) {
         rec.videoGone = msg.videoState !== 'playing';
         rec.videoStateAt = Date.now();
@@ -102,6 +104,8 @@ function snapshot() {
       cropLabel: r.cropLabel,
       size: r.cropper.info.outW ? `${r.cropper.info.outW}×${r.cropper.info.outH}` : '',
       error: r.error || null,
+      source: r.source,
+      bitrateMbps: r.bitrateMbps,
       hasAudio: Boolean(r.monitor),
       monitorMuted: r.monitor ? r.monitor.gain.value === 0 : false,
     })),
@@ -111,7 +115,7 @@ function snapshot() {
 }
 
 async function start(msg) {
-  const { streamId, tabId, title, tabW, tabH, crop, cropLabel, settings } = msg;
+  const { streamId, tabId, title, tabW, tabH, crop, cropLabel, settings, source } = msg;
   const dpr = msg.screenDpr || window.devicePixelRatio || 1;
   const rec = {
     id: crypto.randomUUID(),
@@ -119,6 +123,7 @@ async function start(msg) {
     title: title || '',
     cropLabel,
     crop, // 「自動框住影片」時會在錄影途中被更新
+    source: source || null, // 影片來源規格 {w, h, kbps}，只有「自動框住影片」才有
     settings,
     startedAt: Date.now(),
     part: 0,
@@ -178,7 +183,11 @@ async function start(msg) {
         return computeRect(fw, fh, firstSize === `${fw}x${fh}` ? tabW / tabH : null, rec.crop);
       },
       (err) => endWithError(rec, `畫面處理失敗：${err.message}`),
+      () => (rec.source?.w ? { w: rec.source.w, h: rec.source.h } : null), // 錄影尺寸不超過來源解析度
     );
+    // 第一格出來前就要開始錄，先估一個輸出尺寸給「自動」畫質用
+    const c = crop || { w: 1, h: 1 };
+    rec.estOut = limitSize(Math.round(tabW * dpr * c.w), Math.round(tabH * dpr * c.h), rec.source);
     rec.stream = new MediaStream([rec.cropper.track, ...audioTracks]);
     rec.mime = pickMimeType(settings.codec, audioTracks.length > 0);
     await startSegment(rec);
@@ -213,9 +222,14 @@ async function startSegment(rec) {
   let seg;
   try {
     if (rec.stopping) throw new Error('stopping');
+    const info = rec.cropper.info;
+    // 畫質選「自動」時，每一段開始時依當下的來源規格重新決定位元率
+    rec.bitrateMbps = chooseBitrate(
+      rec.settings.bitrateMbps, info.outW || rec.estOut.w, info.outH || rec.estOut.h, rec.settings.fps, rec.source?.kbps,
+    );
     const mr = new MediaRecorder(rec.stream, {
       mimeType: rec.mime,
-      videoBitsPerSecond: rec.settings.bitrateMbps * 1e6,
+      videoBitsPerSecond: rec.bitrateMbps * 1e6,
       audioBitsPerSecond: 128000,
     });
     seg = { name, mr, startedAt: Date.now(), chain: Promise.resolve(), failed: false };

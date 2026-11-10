@@ -38,7 +38,8 @@ function even(n) {
 // 注意：不能用 new VideoFrame(frame, { visibleRect }) 裁切，實測 MediaRecorder 會忽略
 // visibleRect，錄出全黑畫面，所以一律畫到 OffscreenCanvas 上再產生新影格。
 // rectFor(fw, fh) 在來源尺寸改變或 refresh() 後呼叫；onError 在處理失敗時呼叫（使用者停止時不會呼叫）。
-export function createCroppedTrack(srcTrack, rectFor, onError) {
+// outLimit() 在第一格時呼叫，回傳 {w, h} 時輸出尺寸不會超過它（例如影片來源的解析度），null 表示不限制。
+export function createCroppedTrack(srcTrack, rectFor, onError, outLimit) {
   const processor = new MediaStreamTrackProcessor({ track: srcTrack });
   const generator = new MediaStreamTrackGenerator({ kind: 'video' });
   const reader = processor.readable.getReader();
@@ -65,8 +66,9 @@ export function createCroppedTrack(srcTrack, rectFor, onError) {
             lastKey = key;
             rect = rectFor(fw, fh);
             if (!canvas) {
-              info.outW = rect.width;
-              info.outH = rect.height;
+              const out = limitSize(rect.width, rect.height, outLimit?.());
+              info.outW = out.w;
+              info.outH = out.h;
               canvas = new OffscreenCanvas(info.outW, info.outH);
               ctx = canvas.getContext('2d', { alpha: false });
             }
@@ -129,6 +131,21 @@ export function autoPauseStep(s, active, now, pauseMs, resumeMs) {
   }
   s.activeSince ??= now;
   return now - s.activeSince >= resumeMs ? 'resume' : null;
+}
+
+// 等比縮小到不超過 limit（影片在畫面上被放大時，放大的部分沒有多出細節，只會讓檔案變大）
+export function limitSize(w, h, limit) {
+  if (!limit?.w || !limit?.h) return { w, h };
+  const scale = Math.min(1, limit.w / w, limit.h / h);
+  return { w: Math.max(2, even(w * scale)), h: Math.max(2, even(h * scale)) };
+}
+
+// 畫質選「自動（依來源）」時的位元率（Mbps）：
+// 量得到來源位元率就用它的 1.5 倍（重新壓縮會損失一些，要留空間）；量不到就依解析度估算（每像素 0.1 bit）。
+export function chooseBitrate(settingMbps, outW, outH, fps, srcKbps) {
+  if (settingMbps > 0) return settingMbps;
+  const mbps = srcKbps ? (srcKbps * 1.5) / 1000 : (outW * outH * fps * 0.1) / 1e6;
+  return Math.round(Math.min(12, Math.max(1, mbps)) * 10) / 10;
 }
 
 // 把 sw×sh 的畫面等比縮放放進 ow×oh 裡、置中；比例差不到 1% 時直接填滿，避免多出一條細黑邊

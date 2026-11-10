@@ -65,6 +65,7 @@ function renderCurrent() {
         monitorButton(rec),
         el('button', { class: 'primary', textContent: '停止錄影', onclick: () => stop(rec.id) })),
       el('div', { class: 'muted', dataset: { seg: rec.id } }),
+      el('div', { class: 'muted', dataset: { src: rec.id } }),
     );
   } else {
     const sel = el('select', { id: 'crop-sel' },
@@ -211,6 +212,7 @@ function renderRecordings() {
         el('div', { class: 'row' },
           el('span', { class: 'rec-clock', dataset: { clock: r.id } }),
           el('span', { class: 'muted', dataset: { seg: r.id } })),
+        el('div', { class: 'muted', dataset: { src: r.id } }),
         r.error ? el('div', { class: 'error', textContent: r.error }) : null),
     ),
   );
@@ -225,7 +227,18 @@ function updateClocks() {
       ? `沒畫面也沒聲音，自動暫停中 ${fmtClock(now - r.pausedAt)} · ${where}`
       : `第 ${r.part} 段 ${fmtClock(now - r.segStartedAt)} · ${where}`;
     for (const node of document.querySelectorAll(`[data-seg="${r.id}"]`)) node.textContent = seg;
+    for (const node of document.querySelectorAll(`[data-src="${r.id}"]`)) node.textContent = sourceLine(r);
   }
+}
+
+// 「來源 720×1280 · 約 1.8 Mbps → 錄影 682×1214 · 6 Mbps」：比較來源規格跟錄影設定
+function sourceLine(r) {
+  const rec = `錄影 ${r.size || '—'}${r.bitrateMbps ? ` · ${r.bitrateMbps} Mbps` : ''}`;
+  if (!r.source?.w) return rec;
+  let kbps = ' · 位元率量測中';
+  if (r.source.kbps) kbps = ` · 約 ${(r.source.kbps / 1000).toFixed(1)} Mbps`;
+  else if (r.source.measurable === false) kbps = ' · 量不到位元率';
+  return `來源 ${r.source.w}×${r.source.h}${kbps} → ${rec}`;
 }
 
 // ---- 未存的錄影 ----
