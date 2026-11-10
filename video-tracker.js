@@ -46,20 +46,53 @@ export function videoTrackerMain(recId) {
     if (x2 - x < 2 || y2 - y < 2) return null;
 
     // 換成可視區座標，只留在可視區裡的部分
-    const vx1 = Math.max(0, r.left + (left + x) * sx), vy1 = Math.max(0, r.top + (top + y) * sy);
-    const vx2 = Math.min(innerWidth, r.left + (left + x2) * sx), vy2 = Math.min(innerHeight, r.top + (top + y2) * sy);
+    let vx1 = Math.max(0, r.left + (left + x) * sx), vy1 = Math.max(0, r.top + (top + y) * sy);
+    let vx2 = Math.min(innerWidth, r.left + (left + x2) * sx), vy2 = Math.min(innerHeight, r.top + (top + y2) * sy);
+    // 外層容器設了 overflow 裁切時，影片只有容器範圍內看得到（影片元素本身可能大得多）
+    for (let el = v.parentElement; el && el !== document.documentElement; el = el.parentElement) {
+      const ps = getComputedStyle(el);
+      if (ps.overflowX === 'visible' && ps.overflowY === 'visible' && ps.clipPath === 'none') continue;
+      const pr = el.getBoundingClientRect();
+      if (ps.overflowX !== 'visible' || ps.clipPath !== 'none') { vx1 = Math.max(vx1, pr.left); vx2 = Math.min(vx2, pr.right); }
+      if (ps.overflowY !== 'visible' || ps.clipPath !== 'none') { vy1 = Math.max(vy1, pr.top); vy2 = Math.min(vy2, pr.bottom); }
+    }
     if (vx2 - vx1 < 2 || vy2 - vy1 < 2) return null;
     return { x: vx1, y: vy1, w: vx2 - vx1, h: vy2 - vy1 };
   }
 
-  // 回傳最大、正在顯示的影片元素和它的畫面位置（比例）；沒有影片時是 null
+  // 影片在畫面上是不是被另一支影片蓋住（例如鋪滿整頁、當背景用的模糊影片）。
+  // 只看影片：直播畫面上常疊著透明的按鈕、留言層，那些不算擋住。
+  // 網頁常把影片設成 pointer-events: none，那樣 elementsFromPoint 會找不到，所以檢查時暫時打開
+  function coveredByOtherVideo(v, r, videos) {
+    const saved = videos.map((el) => [el, el.style.getPropertyValue('pointer-events'), el.style.getPropertyPriority('pointer-events')]);
+    for (const [el] of saved) el.style.setProperty('pointer-events', 'auto', 'important');
+    try {
+      const stack = document.elementsFromPoint(r.x + r.w / 2, r.y + r.h / 2);
+      const topVideo = stack.find((el) => el.tagName === 'VIDEO');
+      return Boolean(topVideo) && topVideo !== v;
+    } finally {
+      for (const [el, value, prio] of saved) {
+        if (value) el.style.setProperty('pointer-events', value, prio);
+        else el.style.removeProperty('pointer-events');
+      }
+    }
+  }
+
+  // 回傳最大、正在顯示、沒被其他影片蓋住的影片元素和它的畫面位置（比例）；沒有影片時是 null
   function findVideo() {
-    let best = null, bestEl = null;
-    for (const v of document.querySelectorAll('video')) {
+    const videos = [...document.querySelectorAll('video')];
+    const shown = [];
+    for (const v of videos) {
       const cs = getComputedStyle(v);
       if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) continue;
       const r = contentRect(v);
-      if (r && (!best || r.w * r.h > best.w * best.h)) { best = r; bestEl = v; }
+      if (r) shown.push({ v, r });
+    }
+    // 優先選沒被蓋住的；萬一全部都判斷成被蓋住，退回選最大的
+    const visible = shown.filter(({ v, r }) => !coveredByOtherVideo(v, r, videos));
+    let best = null, bestEl = null;
+    for (const { v, r } of visible.length ? visible : shown) {
+      if (!best || r.w * r.h > best.w * best.h) { best = r; bestEl = v; }
     }
     if (!best) return null;
     return { el: bestEl, rect: { x: best.x / innerWidth, y: best.y / innerHeight, w: best.w / innerWidth, h: best.h / innerHeight } };
