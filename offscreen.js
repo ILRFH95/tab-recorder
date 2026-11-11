@@ -2,7 +2,7 @@
 //
 // 每個 OPFS 檔案的生命週期：busy（寫入中）→ downloading（交給瀏覽器下載）→ 下載完成後由 sw.js 刪除。
 // 兩個集合之間不留空檔，所以檔案在任何時刻都不會被誤認成「未存的錄影」。
-import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep, chooseBitrate, limitSize } from './recorder-core.js';
+import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep, chooseBitrate, limitSize, captureScale } from './recorder-core.js';
 import { tempFileName } from './common.js';
 
 const MAX_QUEUED_BYTES = 256 * 1024 * 1024; // 還沒寫進硬碟的資料超過這個量就停止錄影
@@ -106,6 +106,9 @@ function snapshot() {
       error: r.error || null,
       source: r.source,
       bitrateMbps: r.bitrateMbps,
+      captureScale: r.captureScale,
+      // 實際擷取倍率：第一格的寬度跟分頁像素寬度比較；還沒有畫面時是 0
+      actualScale: r.cropper.info.frameW ? Math.round((r.cropper.info.frameW / r.tabPxW) * 100) / 100 : 0,
       hasAudio: Boolean(r.monitor),
       monitorMuted: r.monitor ? r.monitor.gain.value === 0 : false,
     })),
@@ -117,6 +120,9 @@ function snapshot() {
 async function start(msg) {
   const { streamId, tabId, title, tabW, tabH, crop, cropLabel, settings, source } = msg;
   const dpr = msg.screenDpr || window.devicePixelRatio || 1;
+  const tabPxW = Math.round(tabW * dpr), tabPxH = Math.round(tabH * dpr);
+  // 影片在畫面上比來源小時，要求更大的擷取尺寸，讓瀏覽器用更高倍率重畫分頁
+  const scale = captureScale(tabPxW, tabPxH, crop, source);
   const rec = {
     id: crypto.randomUUID(),
     tabId,
@@ -139,6 +145,8 @@ async function start(msg) {
     lastSoundAt: Date.now(),
     videoGone: false,
     videoStateAt: 0,
+    tabPxW,
+    captureScale: scale, // 要求的擷取倍率；實際倍率看第一格的尺寸
   };
 
   try {
@@ -148,8 +156,8 @@ async function start(msg) {
         mandatory: {
           chromeMediaSource: 'tab',
           chromeMediaSourceId: streamId,
-          maxWidth: Math.round(tabW * dpr),
-          maxHeight: Math.round(tabH * dpr),
+          maxWidth: Math.round(tabPxW * scale),
+          maxHeight: Math.round(tabPxH * scale),
           maxFrameRate: settings.fps,
         },
       },
@@ -187,7 +195,7 @@ async function start(msg) {
     );
     // 第一格出來前就要開始錄，先估一個輸出尺寸給「自動」畫質用
     const c = crop || { w: 1, h: 1 };
-    rec.estOut = limitSize(Math.round(tabW * dpr * c.w), Math.round(tabH * dpr * c.h), rec.source);
+    rec.estOut = limitSize(Math.round(tabPxW * scale * c.w), Math.round(tabPxH * scale * c.h), rec.source);
     rec.stream = new MediaStream([rec.cropper.track, ...audioTracks]);
     rec.mime = pickMimeType(settings.codec, audioTracks.length > 0);
     await startSegment(rec);
