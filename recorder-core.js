@@ -45,8 +45,7 @@ export function createCroppedTrack(srcTrack, rectFor, onError, outLimit) {
   const reader = processor.readable.getReader();
   const writer = generator.writable.getWriter();
   // dark：最近一次檢查時畫面是不是幾乎全黑（給「自動暫停」用）
-  // frameW／frameH：瀏覽器實際送來的分頁畫面尺寸
-  const info = { outW: 0, outH: 0, frameW: 0, frameH: 0, dark: false };
+  const info = { outW: 0, outH: 0, dark: false };
   let lastKey = '', rect = null, dest = null, canvas = null, ctx = null, stopped = false;
   // 每秒檢查畫布上最新的一格是否全黑。用計時器而不是等新影格：
   // 畫面靜止時分頁不會送新影格，等影格的話最後一格可能永遠沒被檢查到
@@ -65,8 +64,6 @@ export function createCroppedTrack(srcTrack, rectFor, onError, outLimit) {
           const key = `${fw}x${fh}`;
           if (key !== lastKey) {
             lastKey = key;
-            info.frameW = fw;
-            info.frameH = fh;
             rect = rectFor(fw, fh);
             if (!canvas) {
               const out = limitSize(rect.width, rect.height, outLimit?.());
@@ -144,15 +141,22 @@ export function limitSize(w, h, limit) {
 }
 
 // 影片在畫面上比來源小時，向瀏覽器要求比分頁大的擷取尺寸（倍率）。
-// Chromium 擷取分頁時，如果要求的尺寸比分頁大，會用更高的倍率重畫分頁（最多約 2 倍），
-// 錄到的影片就能接近來源解析度，跟螢幕解析度無關。瀏覽器不支援時只會拿到原本的尺寸，不會出錯。
+// Chromium 擷取分頁時，如果要求的尺寸比分頁大，可能會用更高的倍率重畫分頁，
+// 錄到的影片就能接近來源解析度，跟螢幕解析度無關。瀏覽器不照做時影格只是被放大，不會出錯。
+// Chromium 的規則（content/browser/media/capture/web_contents_auto_scaler.cc）：
+// 重畫倍率四捨五入到 0.25 的倍數、限制在 1～2 倍，要求的尺寸跟目前畫面差距在 1/8 以內就不重畫
+// （所以要求 1.08 倍等於沒要求）。這裡把倍率向上取到 0.25 的倍數，上限也向下對齊 0.25，
+// 要求的倍率就一定是瀏覽器會採用的級距。
 // tabPxW／tabPxH 是分頁的實際像素，crop 是範圍比例，source 是影片來源解析度。
+const SCALE_STEP = 0.25;
 export function captureScale(tabPxW, tabPxH, crop, source) {
   if (!source?.w || !source?.h || !crop?.w || !crop?.h) return 1;
   const need = Math.max(source.w / (tabPxW * crop.w), source.h / (tabPxH * crop.h)) * 1.02; // 留一點誤差
+  if (need < 1.03) return 1; // 差不到 3% 不值得重畫
   const maxByDim = Math.min(4096 / tabPxW, 4096 / tabPxH); // 擷取尺寸不要超過 4096
-  const scale = Math.min(2, maxByDim, Math.max(1, need));
-  return scale < 1.03 ? 1 : Math.round(scale * 100) / 100;
+  const cap = Math.floor(Math.min(2, maxByDim) / SCALE_STEP) * SCALE_STEP;
+  const scale = Math.min(cap, Math.ceil(need / SCALE_STEP - 1e-9) * SCALE_STEP);
+  return scale > 1 ? scale : 1;
 }
 
 // 畫質選「自動（依來源）」時的位元率（Mbps）：

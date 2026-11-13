@@ -234,10 +234,8 @@ function updateClocks() {
 // 「來源 720×1280 · 約 1.8 Mbps → 錄影 682×1214 · 6 Mbps」：比較來源規格跟錄影設定
 function sourceLine(r) {
   let rec = `錄影 ${r.size || '—'}${r.bitrateMbps ? ` · ${r.bitrateMbps} Mbps` : ''}`;
-  // 有要求高解析擷取時，顯示瀏覽器實際給了幾倍
-  if (r.captureScale > 1 && r.actualScale) {
-    rec += r.actualScale >= 1.03 ? ` · 高解析擷取 ${r.actualScale}×` : ' · 瀏覽器沒有提高解析度';
-  }
+  // 有要求高解析擷取時，顯示要求了幾倍。瀏覽器有沒有照做看不出來，不能寫成「實際」倍率
+  if (r.captureScale > 1) rec += ` · 已要求 ${r.captureScale}× 擷取`;
   if (!r.source?.w) return rec;
   let kbps = ' · 位元率量測中';
   if (r.source.kbps) kbps = ` · 約 ${(r.source.kbps / 1000).toFixed(1)} Mbps`;

@@ -106,9 +106,9 @@ function snapshot() {
       error: r.error || null,
       source: r.source,
       bitrateMbps: r.bitrateMbps,
+      // 要求的擷取倍率。影格尺寸一定等於要求的尺寸（分頁擷取是固定解析度），
+      // 瀏覽器有沒有真的用這個倍率重畫，從擷取端看不出來，所以只回報要求值
       captureScale: r.captureScale,
-      // 實際擷取倍率：第一格的寬度跟分頁像素寬度比較；還沒有畫面時是 0
-      actualScale: r.cropper.info.frameW ? Math.round((r.cropper.info.frameW / r.tabPxW) * 100) / 100 : 0,
       hasAudio: Boolean(r.monitor),
       monitorMuted: r.monitor ? r.monitor.gain.value === 0 : false,
     })),
@@ -145,8 +145,7 @@ async function start(msg) {
     lastSoundAt: Date.now(),
     videoGone: false,
     videoStateAt: 0,
-    tabPxW,
-    captureScale: scale, // 要求的擷取倍率；實際倍率看第一格的尺寸
+    captureScale: scale, // 要求的擷取倍率（瀏覽器不一定照做）
   };
 
   try {
