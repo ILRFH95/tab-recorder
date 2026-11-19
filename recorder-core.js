@@ -1,4 +1,4 @@
-// 錄影核心：裁切、編碼格式選擇、OPFS 寫檔。offscreen.js 與 test/harness.js 共用。
+// 錄影核心：裁切、編碼格式選擇、OPFS 寫檔。由 offscreen.js 使用。
 
 export function pickMimeType(codec, withAudio) {
   const order = { h264: ['h264'], vp8: ['vp8'], vp9: ['vp9'] }[codec] || ['h264', 'vp8', 'vp9'];
