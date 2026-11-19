@@ -35,9 +35,11 @@ async function runVideoTracker(tabId, recId) {
 }
 
 let activeOps = 0; // 進行中、會用到錄影程序的操作數；這段期間不關閉錄影程序
+let opsStarted = 0; // 開始過的操作總數，用來確認一段非同步等待期間有沒有新操作開始（見 reloadIfScheduled）
 
 async function withOp(fn) {
   activeOps++;
+  opsStarted++;
   try {
     return await fn();
   } finally {
@@ -167,6 +169,36 @@ async function flashError() {
 
 // 只要有其他擴充功能在管理下載檔名，downloads.download 指定的 filename 就會被忽略，
 // 檔案會變成 blob 網址裡的亂碼名稱。所以我們自己也在 onDeterminingFilename 指定一次。
+//
+// 下載檔名的優先權：好幾個擴充功能都監聽 onDeterminingFilename 時，瀏覽器以「最後安裝或更新」的那個為準，
+// 而且那個擴充功能就算沒指定檔名（例如 Plucker 對別人的下載什麼都不做），也會把我們指定的名字蓋回預設的亂碼。
+// 2026-11-19 Plucker 自動更新後就發生了（在無頭 Edge 157 重現過）。擴充功能重新載入會讓我們重新變成
+// 「最後更新」的那個，所以瀏覽器啟動時先重新載入一次；錄影途中才被蓋掉的話，等沒有錄影和存檔時再重新載入。
+// 只對「載入未封裝」的安裝有效（重新載入會更新安裝時間），從商店裝的版本不這樣做。
+const RELOAD_KEY = 'reloadForFilename';
+
+async function canReloadForPriority() {
+  const self = await chrome.management.getSelf().catch(() => null);
+  return self?.installType === 'development';
+}
+
+// 檔名被蓋掉時呼叫：記下來，等錄影程序閒置關閉時重新載入。回傳之後會不會自動修正
+async function scheduleReloadForFilename() {
+  if (!(await canReloadForPriority())) return false;
+  await chrome.storage.local.set({ [RELOAD_KEY]: Date.now() });
+  return true;
+}
+
+// 只在錄影程序已經關掉（沒有錄影、寫入、下載）時呼叫。opsAtCheck 是確認閒置當時的 opsStarted：
+// 之後的非同步等待期間若有新操作開始（開始錄影、補存檔），就不重新載入，免得中斷它
+async function reloadIfScheduled(opsAtCheck) {
+  if (!(await chrome.storage.local.get(RELOAD_KEY))[RELOAD_KEY]) return;
+  if (await hasOffscreen()) return;
+  // 最後一次等待之後同步確認，中間沒有空檔讓新操作插進來
+  if (activeOps !== 0 || opsStarted !== opsAtCheck) return;
+  chrome.runtime.reload(); // 重新載入後 onInstalled 會清掉這個記號
+}
+
 const wantedNames = new Map(); // blob URL -> 要存的路徑
 
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
@@ -229,9 +261,13 @@ async function finishDownload(id, state) {
       // 已經存到下載資料夾，刪掉 OPFS 裡的暫存
       const root = await navigator.storage.getDirectory();
       await root.removeEntry(name).catch(() => {});
-      // 其他下載工具（例如 IDM）可能還是改掉了檔名或位置，檔案有存到，但要讓使用者知道在哪
+      // 檔名或位置還是被改掉了（見下方「下載檔名的優先權」），檔案有存到，但要讓使用者知道在哪
       if (item?.filename && wanted && !sameSavedName(item.filename, wanted)) {
-        notify(`檔名或位置被其他擴充功能改掉了，實際存在：${item.filename}`);
+        const willFix = await scheduleReloadForFilename();
+        notify(
+          `檔名或位置被其他擴充功能改掉了，實際存在：${item.filename}` +
+            (willFix ? '。等錄影和存檔都結束後，錄影機會自動重新載入，之後的檔案就會存回正確位置' : ''),
+        );
       }
     }
     // 失敗的話保留 OPFS 檔案，之後會出現在「未存的錄影」清單。
@@ -311,10 +347,12 @@ async function handle(msg, sender) {
       });
     case 'idle': // 錄影程序閒置一分鐘：沒有錄影、寫入和下載時就關掉它，釋放資源
       if (activeOps === 0) {
+        const opsAtCheck = opsStarted;
         const { state } = await toOffscreen({ type: 'state' });
         if (activeOps === 0 && !state.recordings.length && !state.busyFiles.length) {
           await chrome.offscreen.closeDocument().catch(() => {});
           applyState(EMPTY);
+          await reloadIfScheduled(opsAtCheck);
         }
       }
       return {};
@@ -373,8 +411,19 @@ async function recoverLeftovers() {
   }
 }
 
-chrome.runtime.onStartup.addListener(() => { withOp(recoverLeftovers); });
-chrome.runtime.onInstalled.addListener(() => { withOp(recoverLeftovers); });
+chrome.runtime.onStartup.addListener(async () => {
+  // 其他擴充功能的更新多半在瀏覽器啟動時套用，先重新載入一次，讓下載檔名由我們決定（見「下載檔名的優先權」）。
+  // 重新載入後 onInstalled 會接著把沒存到的檔案存出來
+  if (await canReloadForPriority()) {
+    chrome.runtime.reload();
+    return;
+  }
+  withOp(recoverLeftovers);
+});
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.storage.local.remove(RELOAD_KEY);
+  withOp(recoverLeftovers);
+});
 
 // 錄影程序每秒會回報一次；超過 5 秒沒消息代表它不在了，清掉徽章
 chrome.alarms.create('watchdog', { periodInMinutes: 0.5 });
