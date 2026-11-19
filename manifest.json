@@ -5,6 +5,7 @@
   "description": "錄製分頁（可框選範圍、同時錄多個分頁），工具列顯示錄影時間，每秒寫入硬碟、當機可救回，可自動分段。",
   "minimum_chrome_version": "116",
   "permissions": ["tabCapture", "offscreen", "downloads", "storage", "activeTab", "scripting", "alarms"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "sw.js", "type": "module" },
   "action": {
     "default_popup": "popup.html",

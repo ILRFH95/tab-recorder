@@ -1,6 +1,6 @@
 import { DEFAULT_SETTINGS, getSettings, fmtClock, fmtSize, recordedMs } from './common.js';
 import { overlayMain } from './overlay.js';
-import { videoTrackerMain } from './video-tracker.js';
+import { runVideoTracker, findFrameSites } from './video-tracker.js';
 
 const AUTO_VIDEO = '__video__'; // 範圍選單裡「自動框住影片」的值
 
@@ -111,6 +111,8 @@ function renderPresetWarning() {
   const box = $('#preset-warn');
   if (!box) return;
   box.replaceChildren();
+  const hint = frameHint();
+  if (hint) box.append(hint);
   const p = selectedPreset();
   if (!sizeMismatch(p)) return;
   box.append(el('div', { class: 'warn' },
@@ -119,12 +121,49 @@ function renderPresetWarning() {
 
 // 在分頁裡量一次影片位置（給「在網頁上框選…」當起始位置）
 async function measureVideo() {
-  const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: videoTrackerMain, args: [null] });
-  return res?.result || null;
+  return runVideoTracker(tab.id, null);
 }
+
+// ---- 別的網域框架裡的影片 ----
+// 擴充功能平常只能讀目前分頁的主頁面（activeTab）。影片放在別的網域的內嵌框架裡時（例如 jkface 的直播），
+// 要使用者允許讀取那個網站一次（optional_host_permissions），之後「自動框住影片」才找得到。
+
+let frameSites = []; // 需要使用者允許的框架網站：[{ pattern, host }]
+
+// 打開彈出視窗時、開始失敗後各檢查一次：沒有讀得到的影片、有別的網域的大框架、而且還沒允許過
+async function scanFrames() {
+  try {
+    frameSites = await findFrameSites(tab.id);
+  } catch {
+    frameSites = []; // 瀏覽器內建頁面等不能讀的分頁：不用提示
+  }
+  renderPresetWarning();
+}
+
+const siteNames = (sites) => sites.map((s) => s.host).join('、');
+
+// 選「自動框住影片」而且有需要時，請使用者允許讀取框架的網站。
+// 瀏覽器只在使用者剛點擊時允許詢問，所以這必須是點擊後第一個 await。回傳被拒絕的網站名稱（沒問或允許了是空字串）
+async function askFramePermission(autoVideo) {
+  if (!autoVideo || !frameSites.length) return '';
+  const sites = frameSites;
+  const granted = await chrome.permissions.request({ origins: sites.map((s) => s.pattern) }).catch(() => false);
+  if (!granted) return siteNames(sites);
+  frameSites = [];
+  return '';
+}
+
+function frameHint() {
+  if (!frameSites.length || $('#crop-sel')?.value !== AUTO_VIDEO) return null;
+  return el('div', { class: 'muted' },
+    `影片放在 ${siteNames(frameSites)} 的框架裡。開始錄影或框選時，瀏覽器會請你允許讀取這個網站（只需要一次）。`);
+}
+
+const deniedNote = (host) => (host ? `（影片在 ${host} 的框架裡，要允許讀取這個網站才找得到）` : '');
 
 async function startSelected() {
   const autoVideo = $('#crop-sel')?.value === AUTO_VIDEO;
+  const denied = await askFramePermission(autoVideo);
   const p = selectedPreset();
   lastError = '';
   try {
@@ -139,17 +178,21 @@ async function startSelected() {
     });
     if (res.warning) lastError = res.warning;
   } catch (e) {
-    lastError = `無法開始錄影：${e.message}`;
+    lastError = `無法開始錄影：${e.message}${deniedNote(denied)}`;
   }
   await refreshState();
   renderAll(true);
+  // 多層框架時，剛允許的框架裡可能還有下一層要允許：重新檢查，再按一次開始時會再問
+  if (autoVideo && !currentRec()) await scanFrames();
 }
 
 async function pickOnPage() {
+  const autoVideo = $('#crop-sel')?.value === AUTO_VIDEO;
+  await askFramePermission(autoVideo); // 被拒絕時照樣框選，只是框不會先放在影片上
   const p = selectedPreset();
   let initial = p ? p.crop : null;
   // 選「自動框住影片」時，先把框放在影片上，方便微調
-  if ($('#crop-sel')?.value === AUTO_VIDEO) initial = await measureVideo().catch(() => null);
+  if (autoVideo) initial = await measureVideo().catch(() => null);
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: overlayMain, args: [initial] });
     window.close();
@@ -372,6 +415,7 @@ async function main() {
   renderAll(true);
   renderPresets();
   renderOrphans();
+  if (tab) scanFrames(); // 不等它：結果出來後才補上提示
   setInterval(updateClocks, 250);
   setInterval(async () => {
     await refreshState();

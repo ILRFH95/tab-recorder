@@ -1,7 +1,7 @@
 // Service worker：取得分頁擷取權限、更新工具列徽章、處理下載。
 // 真正的錄影在 offscreen 文件裡進行（它會一直存在，service worker 可能被暫停）。
 import { getSettings, fmtBadge, safeName, downloadFileName, recordedMs } from './common.js';
-import { videoTrackerMain } from './video-tracker.js';
+import { runVideoTracker } from './video-tracker.js';
 
 const EMPTY = { recordings: [], busyFiles: [], errors: [] };
 let lastState = EMPTY;
@@ -26,12 +26,6 @@ async function toOffscreen(msg) {
   const res = await chrome.runtime.sendMessage({ target: 'offscreen', ...msg });
   if (!res?.ok) throw new Error(res?.error || '錄影程序沒有回應');
   return res;
-}
-
-// 在分頁裡執行 videoTrackerMain：recId 為 null 時只量一次影片位置
-async function runVideoTracker(tabId, recId) {
-  const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: videoTrackerMain, args: [recId] });
-  return res?.result || null;
 }
 
 let activeOps = 0; // 進行中、會用到錄影程序的操作數；這段期間不關閉錄影程序
