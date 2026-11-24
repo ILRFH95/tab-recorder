@@ -379,7 +379,7 @@ async function deletePreset(id) {
 
 async function initSettings() {
   const s = await getSettings();
-  const fields = ['segmentMinutes', 'folder', 'audio', 'codec', 'bitrateMbps', 'fps', 'autoPause'];
+  const fields = ['segmentMinutes', 'folder', 'audio', 'codec', 'bitrateMbps', 'fps', 'autoPause', 'hideCursor'];
   for (const key of fields) {
     const input = $(`#${key}`);
     if (input.type === 'checkbox') input.checked = s[key];

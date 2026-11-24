@@ -8,6 +8,7 @@ export const DEFAULT_SETTINGS = {
   bitrateMbps: 6,
   fps: 30,
   autoPause: true, // 沒畫面也沒聲音 30 秒就自動暫停，恢復後存成新檔案
+  hideCursor: true, // 滑鼠在錄影範圍內時把游標換成透明，錄影裡就不會有游標（見 cursor-hider.js）
 };
 
 export async function getSettings() {

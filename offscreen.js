@@ -124,6 +124,8 @@ function snapshot() {
       pausedMs: r.pausedMs,
       part: r.part,
       cropLabel: r.cropLabel,
+      crop: r.crop || null, // 範圍（分頁可視區的比例），隱藏游標用
+      hideCursor: Boolean(r.settings.hideCursor), // 這次錄影開始時的設定
       size: r.cropper.info.outW ? `${r.cropper.info.outW}×${r.cropper.info.outH}` : '',
       error: r.error || null,
       source: r.source,

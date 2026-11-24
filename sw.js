@@ -2,6 +2,7 @@
 // 真正的錄影在 offscreen 文件裡進行（它會一直存在，service worker 可能被暫停）。
 import { getSettings, fmtBadge, safeName, downloadFileName, recordedMs } from './common.js';
 import { runVideoTracker } from './video-tracker.js';
+import { runCursorHider } from './cursor-hider.js';
 
 const EMPTY = { recordings: [], busyFiles: [], errors: [] };
 let lastState = EMPTY;
@@ -55,39 +56,74 @@ async function doStartRecording({ tabId, crop, cropLabel, screenDpr, pageDpr, au
     if (found.srcW && found.srcH) source = { w: found.srcW, h: found.srcH, kbps: null };
     cropLabel = '自動框住影片';
   }
+  const settings = await getSettings();
   await ensureOffscreen();
-  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
   if (!screenDpr && pageDpr) {
     // 網頁的 devicePixelRatio 含網頁縮放比例，要除掉才是螢幕本身的倍率
     const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
     screenDpr = pageDpr / zoom;
   }
-  const res = await toOffscreen({
-    type: 'start',
-    streamId,
-    tabId,
-    title: tab.title,
-    tabW: tab.width || 1280,
-    tabH: tab.height || 720,
-    screenDpr,
-    crop: crop || null,
-    source,
-    cropLabel: cropLabel || (crop ? '自訂範圍' : '整個分頁'),
-    settings: await getSettings(),
-  });
+  const warnings = [];
+  let res;
+  try {
+    // 開始寫入之前先把游標藏好（見 cursor-hider.js）。錄影程序還沒回報這個錄影時，
+    // 隱藏程式靠 pendingCursor 知道錄影正要開始。失敗（例如內建頁面、沒有權限）或框架太久沒反應時錄影照常進行
+    if (settings.hideCursor) {
+      pendingCursor.set(tabId, crop || null);
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('逾時')), 3000));
+      await Promise.race([runCursorHider(tabId, crop), timeout])
+        .catch(() => warnings.push('這個頁面不能隱藏滑鼠游標，這次錄影會錄到游標'));
+    }
+    // 串流 ID 只有幾秒有效，準備工作都做完才取得，馬上交給錄影程序
+    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    res = await toOffscreen({
+      type: 'start',
+      streamId,
+      tabId,
+      title: tab.title,
+      tabW: tab.width || 1280,
+      tabH: tab.height || 720,
+      screenDpr,
+      crop: crop || null,
+      source,
+      cropLabel: cropLabel || (crop ? '自訂範圍' : '整個分頁'),
+      settings,
+    });
+  } finally {
+    pendingCursor.delete(tabId);
+  }
   applyState(res.state);
-  if (autoVideo) {
-    const rec = res.state.recordings.find((r) => r.tabId === tabId);
+  const rec = res.state.recordings.find((r) => r.tabId === tabId);
+  if (autoVideo && rec) {
     // 追蹤失敗時錄影照常進行，只是範圍固定在開始時的位置
-    if (rec) {
-      try {
-        await runVideoTracker(tabId, rec.id);
-      } catch (e) {
-        return { warning: `影片位置追蹤沒有啟動，範圍會固定在開始時的位置：${e.message}` };
-      }
+    try {
+      await runVideoTracker(tabId, rec.id);
+    } catch (e) {
+      warnings.push(`影片位置追蹤沒有啟動，範圍會固定在開始時的位置：${e.message}`);
     }
   }
-  return {};
+  return warnings.length ? { warning: warnings.join('。') } : {};
+}
+
+// 正要開始錄影、而且要隱藏游標的分頁 → 範圍（錄影程序回報之前用）
+const pendingCursor = new Map();
+
+// 隱藏游標的程式問：這個分頁還在錄影嗎？目前範圍是什麼？
+// 直接問錄影程序，「自動框住影片」移動範圍後才能馬上跟上（每秒的狀態回報會慢一點）
+async function cursorState(tabId) {
+  if (pendingCursor.has(tabId)) return { alive: true, crop: pendingCursor.get(tabId) };
+  const state = (await hasOffscreen()) ? (await toOffscreen({ type: 'state' })).state : EMPTY;
+  const rec = state.recordings.find((r) => r.tabId === tabId);
+  // 只看這次錄影開始時的設定：錄影中改設定，下一次錄影才生效
+  return { alive: Boolean(rec?.hideCursor), crop: rec?.crop || null };
+}
+
+// 錄影中的分頁有新文件（換頁、重新整理、之後才出現的框架）時重新放一次隱藏游標的程式。
+// 換到別的網站時可能已經沒有權限（activeTab 只到換站為止），那就算了
+async function reinjectCursorHider(tabId) {
+  const state = (await hasOffscreen()) ? (await toOffscreen({ type: 'state' })).state : EMPTY;
+  const rec = state.recordings.find((r) => r.tabId === tabId);
+  if (rec?.hideCursor) await runCursorHider(tabId, rec.crop).catch(() => {});
 }
 
 async function stopRecording(id) {
@@ -389,6 +425,11 @@ async function handle(msg, sender) {
       if (!(await hasOffscreen())) throw new Error('錄影已經結束');
       await toOffscreen({ type: 'updateCrop', id: msg.recId, crop: msg.crop, videoState: msg.videoState, source: msg.source });
       return {};
+    case 'cursorState':
+      return sender.tab ? cursorState(sender.tab.id) : { alive: false };
+    case 'cursorReinject': // 隱藏游標的程式發現有之後才出現的框架
+      if (sender.tab) await reinjectCursorHider(sender.tab.id);
+      return {};
     case 'deleteFile':
       return withOp(() => deleteFile(msg.name));
     case 'savePreset':
@@ -405,6 +446,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (e) => sendResponse({ ok: false, error: e?.message || String(e) }),
   );
   return true;
+});
+
+// 錄影中的分頁換頁或重新整理後，隱藏游標的程式會消失，載入完成時再放一次
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== 'complete' || !lastState.recordings.some((r) => r.tabId === tabId)) return;
+  reinjectCursorHider(tabId).catch(() => {});
 });
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
