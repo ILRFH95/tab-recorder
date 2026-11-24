@@ -87,6 +87,7 @@ async function doStartRecording({ tabId, crop, cropLabel, screenDpr, pageDpr, au
       crop: crop || null,
       source,
       cropLabel: cropLabel || (crop ? '自訂範圍' : '整個分頁'),
+      autoVideo: Boolean(autoVideo),
       settings,
     });
   } finally {

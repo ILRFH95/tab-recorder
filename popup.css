@@ -75,5 +75,7 @@ details { margin-top: 12px; }
 summary { cursor: pointer; font-weight: bold; }
 #settings label { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; gap: 8px; }
 #folder { width: 150px; }
+#reclog-wrap p { margin: 8px 0; }
+#reclog-status.error { margin-top: 8px; }
 footer { margin-top: 14px; }
 kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; }

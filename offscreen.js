@@ -4,6 +4,7 @@
 // 兩個集合之間不留空檔，所以檔案在任何時刻都不會被誤認成「未存的錄影」。
 import { OpfsWriter, pickMimeType, createCroppedTrack, computeRect, autoPauseStep, chooseBitrate, limitSize, captureScale } from './recorder-core.js';
 import { tempFileName } from './common.js';
+import { logStart, logBeat, logEnd, logWriteError, segmentStartEntry, segmentEndFields, countConcurrent, BEAT_INTERVAL_MS } from './rec-log.js';
 
 const MAX_QUEUED_BYTES = 256 * 1024 * 1024; // 還沒寫進硬碟的資料超過這個量就停止錄影
 // 自動暫停：沒畫面也沒聲音持續 30 秒就暫停（這段存檔），畫面或聲音恢復持續 3 秒就開新檔案繼續錄
@@ -18,6 +19,7 @@ const recentErrors = [];
 let queuedBytes = 0;
 let wasRecording = false;
 let idleSince = null;
+let lastBeatAt = Date.now();
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.target !== 'offscreen') return;
@@ -142,7 +144,7 @@ function snapshot() {
 }
 
 async function start(msg) {
-  const { streamId, tabId, title, tabW, tabH, crop, cropLabel, settings, source } = msg;
+  const { streamId, tabId, title, tabW, tabH, crop, cropLabel, settings, source, autoVideo } = msg;
   const dpr = msg.screenDpr || window.devicePixelRatio || 1;
   const tabPxW = Math.round(tabW * dpr), tabPxH = Math.round(tabH * dpr);
   // 影片在畫面上比來源小時，要求更大的擷取尺寸，讓瀏覽器用更高倍率重畫分頁
@@ -152,6 +154,7 @@ async function start(msg) {
     tabId,
     title: title || '',
     cropLabel,
+    autoVideo: Boolean(autoVideo), // 是不是「自動框住影片」（錄影紀錄用；不能看 cropLabel，範圍組可以取同樣的名字）
     crop, // 「自動框住影片」時會在錄影途中被更新
     source: source || null, // 影片來源規格 {w, h, kbps}，只有「自動框住影片」才有
     settings,
@@ -295,9 +298,17 @@ async function startSegment(rec) {
 
   rec.part = part;
   const prev = rec.current;
+  // 錄影紀錄：mr.start 成功後才建立 key，之後這段的所有更新都用它（見 rec-log.js，不等待、不拋錯）
+  try {
+    seg.logEntry = segmentStartEntry(rec, seg, part, countConcurrent(recs.values(), rec.id));
+    seg.logKey = seg.logEntry.key;
+    logStart(seg.logEntry);
+  } catch (err) {
+    console.warn('[recLog]', err);
+  }
   rec.current = seg;
   // 新的一段先開始再結束舊的，兩段之間不會有空檔
-  if (prev) finishSegment(rec, prev);
+  if (prev) finishSegment(rec, prev, 'rotate');
 }
 
 // 寫檔失敗：之後的資料不再接上去（避免檔案中間缺一塊），
@@ -305,6 +316,7 @@ async function startSegment(rec) {
 function failSegment(rec, seg, message) {
   if (seg.failed) return;
   seg.failed = true;
+  if (seg.logKey) logWriteError(seg.logKey);
   endWithError(rec, message);
 }
 
@@ -314,12 +326,24 @@ function endWithError(rec, message) {
   stop(rec.id);
 }
 
-async function finishSegment(rec, seg) {
+// reason：這段為什麼結束（rotate 分段 / pause 自動暫停 / stop 停止或分頁關閉）；錄影有錯誤時紀錄記成 error
+async function finishSegment(rec, seg, reason) {
+  try {
+    // 已經寫檔失敗的段一併帶上 writeError：開始那筆沒寫成功時，logWriteError 找不到列，要靠這裡補記
+    if (seg.logKey) logEnd(seg.logKey, { ...segmentEndFields(rec, reason), ...(seg.failed ? { writeError: 1 } : {}) }, seg.logEntry);
+  } catch (err) {
+    console.warn('[recLog]', err);
+  }
   try {
     if (seg.mr.state !== 'inactive') seg.mr.stop();
     await seg.stopped;
     await seg.chain; // 最後一段資料在 stop 事件之前就會送出
-    await writer.close(seg.name);
+    try {
+      await writer.close(seg.name); // 關檔時才把資料寫進硬碟，失敗也算這段寫檔失敗
+    } catch (err) {
+      if (seg.logKey) logWriteError(seg.logKey);
+      throw err;
+    }
     if (!seg.failed) await saveFile(seg.name);
   } catch (err) {
     noteError(rec.title, `存檔失敗，檔案保留在「未存的錄影」：${err.message}`);
@@ -339,7 +363,7 @@ async function stop(id) {
     releaseCapture(rec); // 暫停中：目前沒有正在寫的檔案
     return;
   }
-  const done = finishSegment(rec, seg);
+  const done = finishSegment(rec, seg, 'stop');
   await seg.stopped;
   releaseCapture(rec);
   await done;
@@ -353,7 +377,7 @@ function pauseRecording(rec) {
   rec.paused = true;
   rec.pausedAt = Date.now();
   rec.activeSince = null;
-  finishSegment(rec, seg);
+  finishSegment(rec, seg, 'pause');
   sendTick();
 }
 
@@ -424,6 +448,16 @@ setInterval(() => {
   }
   if (recs.size || wasRecording) sendTick();
   wasRecording = recs.size > 0;
+  // 每分鐘更新進行中各段的 lastSeen，當機時紀錄才估得出結束時間
+  if (now - lastBeatAt >= BEAT_INTERVAL_MS) {
+    lastBeatAt = now;
+    try {
+      const keys = [...recs.values()].map((r) => r.current?.logKey).filter(Boolean);
+      if (keys.length) logBeat(keys, now);
+    } catch (err) {
+      console.warn('[recLog]', err);
+    }
+  }
   // 沒有錄影、寫入和下載持續一分鐘，就請背景程式把這個錄影程序關掉（下次要用時再開）
   if (recs.size || busy.size || downloading.size) {
     idleSince = null;

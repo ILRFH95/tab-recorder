@@ -396,6 +396,69 @@ async function initSettings() {
   }
 }
 
+// ---- 錄影紀錄 ----
+// 打開「錄影紀錄」才載入 rec-log.js 並讀資料庫，不拖慢彈出視窗；讀不到也不影響其他功能
+
+let reclogLoad = 0; // 只採用最後一次讀取的結果
+
+async function loadReclog() {
+  const n = ++reclogLoad;
+  const status = $('#reclog-status');
+  const btn = $('#reclog-export');
+  // canRetry：讀取失敗，或還沒有紀錄（彈出視窗開著時錄完第一段，按一下就能更新）
+  const show = (text, isError, canExport, canRetry = isError) => {
+    if (n !== reclogLoad) return;
+    status.textContent = text;
+    status.classList.toggle('error', isError);
+    btn.hidden = !canExport;
+    $('#reclog-retry').hidden = !canRetry;
+  };
+  show('讀取中…', false, false);
+  try {
+    const { readAll, fmtDate } = await import('./rec-log.js');
+    const rows = await readAll();
+    if (!rows.length) {
+      show('還沒有紀錄。之後每段錄影的開始、結束時間會記在這裡。', false, false, true);
+      return;
+    }
+    const first = Math.min(...rows.map((r) => r.start).filter(Number.isFinite));
+    show(`共 ${rows.length} 段，最早 ${fmtDate(first)}`, false, true);
+  } catch (e) {
+    console.warn('[recLog]', e);
+    show('讀不到錄影紀錄，按「重新讀取」再試一次。錄影不受影響。', true, false);
+  }
+}
+
+async function exportReclog() {
+  const btn = $('#reclog-export');
+  btn.disabled = true; // 匯出期間停用，避免連點
+  try {
+    const { readAll, toCsv, fmtStamp } = await import('./rec-log.js');
+    const now = Date.now();
+    const csv = toCsv(await readAll(), now);
+    // 用 data 網址：彈出視窗關掉 blob 網址就失效，而且 sw.js 只管 blob:chrome-extension 開頭的下載，不會干擾
+    const a = el('a', { href: `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`, download: `錄影紀錄_${fmtStamp(now)}.csv` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    loadReclog(); // 重新顯示筆數，順便清掉上一次匯出失敗的訊息
+  } catch (e) {
+    console.warn('[recLog]', e);
+    $('#reclog-status').textContent = '匯出失敗，請再按一次「匯出 CSV」。';
+    $('#reclog-status').classList.add('error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function initReclog() {
+  $('#reclog-wrap').addEventListener('toggle', (ev) => {
+    if (ev.target.open) loadReclog();
+  });
+  $('#reclog-export').addEventListener('click', exportReclog);
+  $('#reclog-retry').addEventListener('click', loadReclog);
+}
+
 // ---- 主流程 ----
 
 function renderAll(force = false) {
@@ -410,6 +473,7 @@ function renderAll(force = false) {
 }
 
 async function main() {
+  initReclog(); // 第一個 await 之前就接上，彈出視窗還在載入時展開也讀得到
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   await Promise.all([refreshState(), loadPresets(), initSettings()]);
   renderAll(true);
