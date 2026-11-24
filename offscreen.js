@@ -78,9 +78,31 @@ async function handle(msg) {
     case 'note':
       noteError('', msg.message);
       return {};
+    case 'clickDownload':
+      await clickDownload(msg.url, msg.file);
+      return {};
     default:
       throw new Error(`未知的指令：${msg.type}`);
   }
+}
+
+// 用 download 屬性下載，檔名才是瀏覽器的預設檔名，不會被其他擴充功能蓋成亂碼（見 sw.js「下載檔名的優先權」）。
+// 同一個頁面一秒內點超過 10 個下載連結，瀏覽器會直接略過，所以排隊、每個之間隔一段時間（例如啟動時一次補存很多檔案）
+const CLICK_GAP_MS = 200;
+let clickQueue = Promise.resolve();
+
+function clickDownload(url, file) {
+  const run = clickQueue.then(async () => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    await new Promise((r) => setTimeout(r, CLICK_GAP_MS));
+  });
+  clickQueue = run.catch(() => {});
+  return run;
 }
 
 function noteError(title, message) {

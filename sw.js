@@ -161,14 +161,17 @@ async function flashError() {
 
 // ---- 下載 ----
 
-// 只要有其他擴充功能在管理下載檔名，downloads.download 指定的 filename 就會被忽略，
-// 檔案會變成 blob 網址裡的亂碼名稱。所以我們自己也在 onDeterminingFilename 指定一次。
-//
 // 下載檔名的優先權：好幾個擴充功能都監聽 onDeterminingFilename 時，瀏覽器以「最後安裝或更新」的那個為準，
-// 而且那個擴充功能就算沒指定檔名（例如 Plucker 對別人的下載什麼都不做），也會把我們指定的名字蓋回預設的亂碼。
-// 2026-11-19 Plucker 自動更新後就發生了（在無頭 Edge 157 重現過）。擴充功能重新載入會讓我們重新變成
-// 「最後更新」的那個，所以瀏覽器啟動時先重新載入一次；錄影途中才被蓋掉的話，等沒有錄影和存檔時再重新載入。
-// 只對「載入未封裝」的安裝有效（重新載入會更新安裝時間），從商店裝的版本不這樣做。
+// 而且那個擴充功能就算沒指定檔名（例如 IDM 對 blob 網址的下載什麼都不做），也會把我們指定的名字蓋回預設檔名。
+// 2026-11-19 Plucker、2026-11-24 IDM Integration Module 自動更新後都發生過（在無頭 Edge 157、158 重現過）。
+//
+// 所以分兩層：
+// 1. 預設檔名本身就要對：由錄影程序用 <a download="檔名"> 下載，不用 downloads.download。
+//    downloads.download 的 filename 被蓋掉後會退回 blob 網址的亂碼；download 屬性的檔名才是瀏覽器的預設檔名，
+//    被蓋掉時檔名仍然正確，只是存在下載資料夾最外層（download 屬性不能帶資料夾）。
+// 2. 資料夾由 onDeterminingFilename 指定。被蓋掉時，擴充功能重新載入會讓我們重新變成「最後更新」的那個，
+//    所以瀏覽器啟動時先重新載入一次；錄影途中才被蓋掉的話，等沒有錄影和存檔時再重新載入。
+//    只對「載入未封裝」的安裝有效（重新載入會更新安裝時間），從商店裝的版本不這樣做。
 const RELOAD_KEY = 'reloadForFilename';
 
 async function canReloadForPriority() {
@@ -194,9 +197,11 @@ async function reloadIfScheduled(opsAtCheck) {
 }
 
 const wantedNames = new Map(); // blob URL -> 要存的路徑
+const OUR_BLOB = `blob:chrome-extension://${chrome.runtime.id}/`;
 
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  if (item.byExtensionId !== chrome.runtime.id) return; // 不是我們的下載，不插手
+  // 不是我們的下載，不插手。要同步判斷：對別人的下載就算只回空的 suggest()，我們較晚更新時也會蓋掉別人的檔名
+  if (!item.url.startsWith(OUR_BLOB)) return;
   const key = `name:${item.url}`;
   const filename = wantedNames.get(item.url);
   if (filename) {
@@ -211,15 +216,36 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   return true;
 });
 
+// 等某個網址的下載出現，回傳下載編號；逾時回傳 null
+function waitForCreated(url, ms) {
+  return new Promise((resolve) => {
+    const done = (id) => {
+      clearTimeout(timer);
+      chrome.downloads.onCreated.removeListener(onCreated);
+      resolve(id);
+    };
+    const onCreated = (item) => {
+      if (item.url === url) done(item.id);
+    };
+    const timer = setTimeout(() => done(null), ms);
+    chrome.downloads.onCreated.addListener(onCreated);
+  });
+}
+
 // 每個下載各存一個 key（dl:<id>），同時有多個下載也不會互相覆蓋。
 async function startDownload({ url, name }) {
   const { folder } = await getSettings();
-  const filename = `${safeName(folder, 'ScreenRecorder')}/${downloadFileName(name)}`; // 同名時瀏覽器會自動加 (1)
+  const file = downloadFileName(name);
+  const filename = `${safeName(folder, 'ScreenRecorder')}/${file}`; // 同名時瀏覽器會自動加 (1)
   wantedNames.set(url, filename);
   await chrome.storage.session.set({ [`name:${url}`]: filename });
   let id;
   try {
-    id = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: false });
+    // 先開始等，再請錄影程序點下載連結（見上方「下載檔名的優先權」）
+    const created = waitForCreated(url, 30000);
+    await toOffscreen({ type: 'clickDownload', url, file });
+    id = await created;
+    if (id == null) throw new Error('瀏覽器沒有開始下載');
   } catch (err) {
     wantedNames.delete(url);
     chrome.storage.session.remove(`name:${url}`);
@@ -255,12 +281,16 @@ async function finishDownload(id, state) {
       // 已經存到下載資料夾，刪掉 OPFS 裡的暫存
       const root = await navigator.storage.getDirectory();
       await root.removeEntry(name).catch(() => {});
-      // 檔名或位置還是被改掉了（見下方「下載檔名的優先權」），檔案有存到，但要讓使用者知道在哪
+      // 檔名或位置還是被改掉了（見上方「下載檔名的優先權」），檔案有存到，但要讓使用者知道在哪
       if (item?.filename && wanted && !sameSavedName(item.filename, wanted)) {
         const willFix = await scheduleReloadForFilename();
+        const folder = wanted.split('/')[0];
+        const inFolder = item.filename.split(/[\\/]/).at(-2) === folder;
         notify(
-          `檔名或位置被其他擴充功能改掉了，實際存在：${item.filename}` +
-            (willFix ? '。等錄影和存檔都結束後，錄影機會自動重新載入，之後的檔案就會存回正確位置' : ''),
+          (inFolder
+            ? `檔名被其他擴充功能改掉了，實際存在：${item.filename}`
+            : `其他擴充功能讓檔案沒有存進「${folder}」資料夾，實際存在：${item.filename}`) +
+            (willFix ? '。等錄影和存檔都結束後，錄影機會自動重新載入，之後的檔案就會照原本的檔名存進「' + folder + '」' : ''),
         );
       }
     }
