@@ -225,12 +225,85 @@ async function scheduleReloadForFilename() {
 
 // 只在錄影程序已經關掉（沒有錄影、寫入、下載）時呼叫。opsAtCheck 是確認閒置當時的 opsStarted：
 // 之後的非同步等待期間若有新操作開始（開始錄影、補存檔），就不重新載入，免得中斷它
+// 回傳有沒有真的重新載入
 async function reloadIfScheduled(opsAtCheck) {
-  if (!(await chrome.storage.local.get(RELOAD_KEY))[RELOAD_KEY]) return;
-  if (await hasOffscreen()) return;
+  if (!(await chrome.storage.local.get(RELOAD_KEY))[RELOAD_KEY]) return false;
+  if (await hasOffscreen()) return false;
   // 最後一次等待之後同步確認，中間沒有空檔讓新操作插進來
-  if (activeOps !== 0 || opsStarted !== opsAtCheck) return;
+  if (activeOps !== 0 || opsStarted !== opsAtCheck) return false;
   chrome.runtime.reload(); // 重新載入後 onInstalled 會清掉這個記號
+  return true;
+}
+
+// 別的擴充功能在錄影機之後安裝或更新，它就排到錄影機前面，之後的錄影會存錯資料夾。
+// 記下它是誰（通知要點名），能重新載入的話趁錄影程序不在時馬上重新載入，不等到存錯一次才處理。
+// 只看有下載權限的：沒有的不能改下載位置。API 看不出誰真的在改檔名，所以這份名單只是「之後裝過的」。
+const RIVALS_KEY = 'priorityRivals';
+const RIVAL_RELOADS_KEY = 'priorityReloads'; // 因為這個原因馬上重新載入的時間
+const RIVAL_RELOAD_LIMIT = 3; // 10 分鐘內最多馬上重新載入 3 次，避免和別的擴充功能互相觸發、一直重新載入
+const RIVAL_RELOAD_WINDOW_MS = 10 * 60000;
+
+// 好幾個擴充功能同時更新時事件會一起來，排隊處理，名單才不會互相覆蓋
+let rivalQueue = Promise.resolve();
+function queueRival(fn) {
+  rivalQueue = rivalQueue.then(fn).catch((e) => console.warn('[priority]', e));
+  return rivalQueue;
+}
+
+async function onOtherInstalled(info) {
+  if (info.id === chrome.runtime.id || !info.enabled || !info.permissions?.includes('downloads')) return;
+  const { [RIVALS_KEY]: rivals = [] } = await chrome.storage.local.get(RIVALS_KEY);
+  const next = [...rivals.filter((r) => r.id !== info.id), { id: info.id, name: info.name, time: Date.now() }].slice(-10);
+  await chrome.storage.local.set({ [RIVALS_KEY]: next });
+  if (await scheduleReloadForFilename()) await reloadNowIfIdle();
+}
+
+// 錄影程序不在、也沒有進行中的操作時馬上重新載入；錄影程序開著（錄影、存檔中，或剛結束還沒關）就交給閒置流程
+async function reloadNowIfIdle() {
+  const opsAtCheck = opsStarted;
+  if (await hasOffscreen()) return;
+  // 沒有錄影程序時，短暫的操作（例如刪除未存的錄影）結束後不會有閒置通知，一分鐘後再檢查
+  if (activeOps !== 0) {
+    chrome.alarms.create(RIVAL_RETRY_ALARM, { when: Date.now() + 60000 });
+    return;
+  }
+  const now = Date.now();
+  const { [RIVAL_RELOADS_KEY]: times = [] } = await chrome.storage.local.get(RIVAL_RELOADS_KEY);
+  const recent = times.filter((t) => now - t < RIVAL_RELOAD_WINDOW_MS);
+  if (recent.length >= RIVAL_RELOAD_LIMIT) {
+    // 次數到上限：等最早那次滿 10 分鐘再檢查一次（期間有錄影的話，錄完的閒置流程也會處理）
+    chrome.alarms.create(RIVAL_RETRY_ALARM, { when: recent[0] + RIVAL_RELOAD_WINDOW_MS + 1000 });
+    return;
+  }
+  // 先記下這次，重新載入後就沒機會記了；沒有真的重新載入（等待期間有新操作開始）就拿掉，不算進上限
+  await chrome.storage.local.set({ [RIVAL_RELOADS_KEY]: [...recent, now] });
+  if (await reloadIfScheduled(opsAtCheck)) return;
+  await chrome.storage.local.set({ [RIVAL_RELOADS_KEY]: recent });
+  // 稍後再檢查；記號已被清掉的話，鬧鐘響了什麼都不做
+  chrome.alarms.create(RIVAL_RETRY_ALARM, { when: Date.now() + 60000 });
+}
+
+const RIVAL_RETRY_ALARM = 'priorityRetry';
+
+chrome.management.onInstalled.addListener((info) => {
+  queueRival(() => onOtherInstalled(info));
+});
+
+// 存錯位置時，通知裡說明是誰造成的。startedAt：這筆下載開始的時間，之後才安裝或更新的不可能影響它
+async function describeRivals(startedAt) {
+  const { [RIVALS_KEY]: rivals = [] } = await chrome.storage.local.get(RIVALS_KEY).catch(() => ({}));
+  const all = await chrome.management.getAll().catch(() => null);
+  const active = (all || []).filter(
+    (e) => e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && e.permissions?.includes('downloads'),
+  );
+  // 記下之後被停用或移除的不算；查不到目前的清單時照紀錄寫
+  const live = (all ? rivals.filter((r) => active.some((e) => e.id === r.id)) : rivals)
+    .filter((r) => !(startedAt <= r.time));
+  if (live.length) {
+    return `很可能是「${live.map((r) => r.name).join('」或「')}」造成的：在錄影機之後安裝或更新過`;
+  }
+  const names = active.map((e) => e.name);
+  return names.length ? `是其他擴充功能造成的，可能是這些有下載權限的擴充功能之一：${names.join('、')}` : '是其他擴充功能造成的';
 }
 
 const wantedNames = new Map(); // blob URL -> 要存的路徑
@@ -325,8 +398,9 @@ async function finishDownload(id, state) {
         const inFolder = item.filename.split(/[\\/]/).at(-2) === folder;
         notify(
           (inFolder
-            ? `檔名被其他擴充功能改掉了，實際存在：${item.filename}`
-            : `其他擴充功能讓檔案沒有存進「${folder}」資料夾，實際存在：${item.filename}`) +
+            ? `檔名被改掉了，實際存在：${item.filename}`
+            : `檔案沒有存進「${folder}」資料夾，實際存在：${item.filename}`) +
+            `。${await describeRivals(Date.parse(item.startTime))}` +
             (willFix ? '。等錄影和存檔都結束後，錄影機會自動重新載入，之後的檔案就會照原本的檔名存進「' + folder + '」' : ''),
         );
       }
@@ -492,8 +566,10 @@ chrome.runtime.onStartup.addListener(async () => {
   }
   withOp(recoverLeftovers);
 });
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.remove(RELOAD_KEY);
+chrome.runtime.onInstalled.addListener(({ reason }) => {
+  // 錄影機自己安裝、更新或重新載入後就排在最前面，之前記下的名單不再適用（瀏覽器更新不影響順序）。
+  // 和別的擴充功能的更新事件排同一個隊，清除時不會吃掉之後才進來的那筆
+  queueRival(() => chrome.storage.local.remove(reason === 'chrome_update' ? RELOAD_KEY : [RELOAD_KEY, RIVALS_KEY]));
   withOp(recoverLeftovers);
 });
 
@@ -502,4 +578,9 @@ chrome.alarms.create('watchdog', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   // service worker 重啟後 lastState 是空的，但舊徽章可能還在，所以不判斷 recordings.length
   if (alarm.name === 'watchdog' && Date.now() - lastTick > 5000) applyState(EMPTY);
+  if (alarm.name === RIVAL_RETRY_ALARM) {
+    queueRival(async () => {
+      if ((await chrome.storage.local.get(RELOAD_KEY))[RELOAD_KEY]) await reloadNowIfIdle();
+    });
+  }
 });

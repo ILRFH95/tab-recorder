@@ -127,6 +127,16 @@ export function overlayMain(initial) {
     if (window.__tabRecOverlay === api) delete window.__tabRecOverlay;
   }
 
+  // 框選途中錄影機可能自動重新載入（見 sw.js「下載檔名的優先權」），這個畫面就連不上錄影機了
+  const RELOADED = '錄影機剛剛自動重新載入，請再按一次「在網頁上框選…」重新框選';
+  async function toSw(msg) {
+    try {
+      return await chrome.runtime.sendMessage({ target: 'sw', ...msg });
+    } catch (err) {
+      return { ok: false, error: chrome.runtime?.id ? err?.message || String(err) : RELOADED };
+    }
+  }
+
   async function startRecording() {
     const crop = cropRatio();
     if (!crop) {
@@ -136,7 +146,7 @@ export function overlayMain(initial) {
     close();
     // 等框選畫面確實從畫面上消失再開始擷取，避免錄到它
     await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(res, 100))));
-    const res = await chrome.runtime.sendMessage({ target: 'sw', type: 'start', crop, pageDpr: devicePixelRatio });
+    const res = await toSw({ type: 'start', crop, pageDpr: devicePixelRatio });
     if (!res?.ok) alert(`無法開始錄影：${res?.error || '未知錯誤'}`);
   }
 
@@ -146,7 +156,7 @@ export function overlayMain(initial) {
       msgEl.textContent = '請先框出範圍';
       return;
     }
-    const res = await chrome.runtime.sendMessage({ target: 'sw', type: 'savePreset', name: $('.name').value, crop });
+    const res = await toSw({ type: 'savePreset', name: $('.name').value, crop });
     msgEl.textContent = res?.ok ? `已${res.replaced ? '更新' : '儲存'}「${res.name}」` : `儲存失敗：${res?.error}`;
   }
 
