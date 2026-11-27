@@ -307,12 +307,13 @@ async function findRivals(startedAt) {
     (e) => e.id !== chrome.runtime.id && e.enabled && e.type === 'extension' && e.permissions?.includes('downloads'),
   );
   // 記下之後被停用或移除的不算；查不到目前的清單時照紀錄寫
-  const live = (all ? rivals.filter((r) => active.some((e) => e.id === r.id)) : rivals)
-    .filter((r) => !(startedAt <= r.time));
+  // 這筆下載開始之後才安裝或更新的，不可能影響它
+  const late = new Set(rivals.filter((r) => startedAt <= r.time).map((r) => r.id));
+  const live = (all ? rivals.filter((r) => active.some((e) => e.id === r.id)) : rivals).filter((r) => !late.has(r.id));
   if (live.length) {
     return `很可能是「${live.map((r) => r.name).join('」或「')}」造成的：在錄影機之後安裝或更新過`;
   }
-  const names = active.map((e) => e.name);
+  const names = active.filter((e) => !late.has(e.id)).map((e) => e.name);
   return names.length ? `是其他擴充功能造成的，可能是這些有下載權限的擴充功能之一：${names.join('、')}` : '是其他擴充功能造成的';
 }
 
@@ -497,7 +498,10 @@ async function handle(msg, sender) {
         if (activeOps === 0 && !state.recordings.length && !state.busyFiles.length) {
           await chrome.offscreen.closeDocument().catch(() => {});
           applyState(EMPTY);
-          await reloadIfScheduled(opsAtCheck);
+          // 等待期間有新操作開始就不會重新載入；錄影程序已經關了，不會再有閒置通知，記號還在的話靠鬧鐘再檢查
+          if (!(await reloadIfScheduled(opsAtCheck)) && (await chrome.storage.local.get(RELOAD_KEY))[RELOAD_KEY]) {
+            chrome.alarms.create(RIVAL_RETRY_ALARM, { when: Date.now() + 60000 });
+          }
         }
       }
       return {};
