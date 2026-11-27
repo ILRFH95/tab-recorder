@@ -285,12 +285,22 @@ async function reloadNowIfIdle() {
 
 const RIVAL_RETRY_ALARM = 'priorityRetry';
 
-chrome.management.onInstalled.addListener((info) => {
+// 更新程式後、瀏覽器還沒重新載入錄影機前，可能還沒有 management 權限，這時 onInstalled 不存在，跳過不能讓整個背景程式出錯
+chrome.management.onInstalled?.addListener((info) => {
   queueRival(() => onOtherInstalled(info));
 });
 
 // 存錯位置時，通知裡說明是誰造成的。startedAt：這筆下載開始的時間，之後才安裝或更新的不可能影響它
 async function describeRivals(startedAt) {
+  try {
+    return await findRivals(startedAt);
+  } catch (err) {
+    console.warn('[priority]', err); // 這段失敗不能擋住存檔的收尾
+    return '是其他擴充功能造成的';
+  }
+}
+
+async function findRivals(startedAt) {
   const { [RIVALS_KEY]: rivals = [] } = await chrome.storage.local.get(RIVALS_KEY).catch(() => ({}));
   const all = await chrome.management.getAll().catch(() => null);
   const active = (all || []).filter(
